@@ -10,7 +10,7 @@ move flips one. "Game over" means there are no legal moves at all.
 from __future__ import annotations
 
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from flask import Flask, jsonify, request, send_from_directory
 
@@ -19,9 +19,34 @@ from solver.engine import apply_move, legal_moves
 from solver.game import GameState, Move
 from solver.resolver import MidGameLayout, build_opaque_state, parse_midgame
 from solver.strategy import flips_hidden_card, plan_steps
+from solver.montecarlo import (
+    estimate as mc_estimate,
+    exact_win_plan,
+    mc_plan_steps,
+    position_estimate as mc_position_estimate,
+)
 from solver import storage
 
+# Monte Carlo defaults (tunable per request). Kept modest so "MC drives
+# recommendations" mode stays usable on positions with many hidden cards. A
+# wall-clock cap (time_budget_s inside estimate) guarantees MC returns a
+# best-effort answer quickly instead of freezing the UI.
+MC_SAMPLES = 60
+MC_SOLVE_BUDGET = 30_000
+MC_TIME_BUDGET_S = 8.0
+
 app = Flask(__name__, static_folder="static", static_url_path="")
+# Dev tool, single user: never cache static assets, so edits to app.js/styles.css
+# always load fresh (avoids the browser serving a stale UI).
+app.config["SEND_FILE_MAX_AGE_DEFAULT"] = 0
+
+
+@app.after_request
+def _no_cache(resp):
+    # Prevent the browser from serving stale JS/CSS/HTML during development.
+    resp.headers["Cache-Control"] = "no-store, max-age=0"
+    return resp
+
 
 storage.init_db()
 
@@ -29,9 +54,23 @@ storage.init_db()
 @dataclass
 class Game:
     """A live game: the current opaque state (face-down cards are UNKNOWN, not
-    guessed) plus the originating layout."""
+    guessed) plus the originating layout. `mc_mode` makes Monte Carlo drive the
+    step recommendations instead of the fast greedy planner. `history` holds
+    snapshots of prior states so a mistaken move/reveal can be undone."""
     state: GameState
     layout: MidGameLayout
+    mc_mode: bool = False
+    history: list = field(default_factory=list)
+
+    def snapshot(self) -> None:
+        """Save the current state so it can be restored by undo."""
+        self.history.append(self.state.clone())
+
+    def undo(self) -> bool:
+        if not self.history:
+            return False
+        self.state = self.history.pop()
+        return True
 
 
 # In-memory store keyed by game id. Fine for a local single-user tool.
@@ -145,14 +184,16 @@ def new_game():
         _save(solved=-1, error=str(exc))
         return jsonify({"error": str(exc)}), 400
 
-    # Build the opaque state (face-down cards stay unknown, never guessed).
+    # Build the opaque state (face-down cards stay unknown, never guessed) and
+    # store the game first so _compute_plan can apply the proven-win shortcut.
     state = build_opaque_state(layout)
-    plan = plan_steps(state, n=3)
+    game = Game(state=state, layout=layout)
+    GAMES[game_id] = game
+    plan = _compute_plan(game, n=3)
 
     # solved=2 here means "accepted & planning" (distinct from the old exact
     # solver's 1=won-proof). gameOver is only true when no legal moves exist.
     _save(solved=0 if plan["gameOver"] else 2)
-    GAMES[game_id] = Game(state=state, layout=layout)
     return jsonify(_plan_response(game_id, state, plan))
 
 
@@ -167,7 +208,8 @@ def _plan_response(game_id, state, plan):
         message = "No legal moves left. Game over."
     else:
         message = ""
-    return {
+    g = GAMES.get(game_id)
+    resp = {
         "gameId": game_id,
         "solved": plan["solved"],       # True only if already won
         "gameOver": plan["gameOver"],   # True if no moves or dead stock cycle
@@ -176,7 +218,40 @@ def _plan_response(game_id, state, plan):
         "steps": plan["steps"],
         "state": serialize_state(state),
         "message": message,
+        "canUndo": bool(g and g.history),
     }
+    # Proven-win plan from the exact solver.
+    if plan.get("exactGuaranteed"):
+        resp["exactGuaranteed"] = True
+        resp["winProbability"] = 1.0
+        resp["exact"] = True
+    # Monte Carlo fields, present only when MC produced the plan.
+    if plan.get("mc"):
+        resp["mc"] = True
+        resp["winProbability"] = plan.get("winProbability")
+        resp["winMargin"] = plan.get("winMargin", 0.0)
+        resp["exact"] = plan.get("exact", False)
+        resp["timedOut"] = plan.get("timedOut", False)
+        resp["perMove"] = plan.get("perMove", [])
+    return resp
+
+
+def _compute_plan(game: "Game", n: int = 3) -> dict:
+    """Pick the recommender.
+
+    If the position is a PROVEN win (exact), follow the exact solver's
+    guaranteed line — faster and certain, so Monte Carlo is skipped even when
+    the toggle is on. Otherwise use Monte Carlo (if mc_mode) or the fast greedy
+    planner.
+    """
+    guaranteed = exact_win_plan(game.state, n=n)
+    if guaranteed is not None:
+        return guaranteed
+    if game.mc_mode:
+        return mc_plan_steps(game.state, n=n, samples=MC_SAMPLES,
+                             solve_budget=MC_SOLVE_BUDGET,
+                             time_budget_s=MC_TIME_BUDGET_S)
+    return plan_steps(game.state, n=n)
 
 
 @app.route("/api/steps/<game_id>", methods=["GET"])
@@ -185,7 +260,7 @@ def get_steps(game_id: str):
     if game is None:
         return jsonify({"error": "unknown game"}), 404
     n = int(request.args.get("n", 3))
-    plan = plan_steps(game.state, n=n)
+    plan = _compute_plan(game, n=n)
     return jsonify(_plan_response(game_id, game.state, plan))
 
 
@@ -203,6 +278,9 @@ def accept_step(game_id: str):
     if not _move_is_legal(game.state, move):
         return jsonify({"error": "move is not legal in current state"}), 400
 
+    skip_plan = bool(data.get("skipPlan", False))
+
+    game.snapshot()  # enable undo of this move (and any reveal it triggers)
     reveal_col = move.src if flips_hidden_card(game.state, move) else None
     game.state = apply_move(game.state, move)
 
@@ -216,7 +294,20 @@ def accept_step(game_id: str):
             "solved": False,
         })
 
-    plan = plan_steps(game.state, n=3)
+    # The move didn't reveal anything. If the client already holds the valid
+    # continuation (it precomputed steps 2..n), it passes skipPlan to avoid a
+    # redundant recompute — we just return the updated board. This matters most
+    # in Monte Carlo mode where planning is expensive.
+    if skip_plan:
+        return jsonify({
+            "gameId": game_id,
+            "state": serialize_state(game.state),
+            "skippedPlan": True,
+            "revealNeeded": None,
+            "canUndo": bool(game.history),
+        })
+
+    plan = _compute_plan(game, n=3)
     resp = _plan_response(game_id, game.state, plan)
     resp["revealNeeded"] = None
     return jsonify(resp)
@@ -269,8 +360,28 @@ def reveal_card(game_id: str):
     # Pin the revealed identity onto the top of the column.
     game.state.tableau[col][-1] = (real, True)
 
-    plan = plan_steps(game.state, n=3)
+    plan = _compute_plan(game, n=3)
     resp = _plan_response(game_id, game.state, plan)
+    resp["revealNeeded"] = None
+    return jsonify(resp)
+
+
+@app.route("/api/undo/<game_id>", methods=["POST"])
+def undo_move(game_id: str):
+    """Undo the last accepted move (and the reveal it triggered, if any),
+    restoring the previous state. Lets you recover from a mistyped reveal or a
+    move you didn't mean to accept."""
+    game = GAMES.get(game_id)
+    if game is None:
+        return jsonify({"error": "unknown game"}), 404
+    if not game.undo():
+        resp = _plan_response(game_id, game.state, _compute_plan(game, n=3))
+        resp["message"] = "Nothing to undo."
+        resp["canUndo"] = False
+        return jsonify(resp)
+    plan = _compute_plan(game, n=3)
+    resp = _plan_response(game_id, game.state, plan)
+    resp["canUndo"] = bool(game.history)
     resp["revealNeeded"] = None
     return jsonify(resp)
 
@@ -334,6 +445,81 @@ def reject_step(game_id: str):
     plan = {"solved": False, "gameOver": False, "steps": steps,
             "revealNext": reveal_next}
     return jsonify(_plan_response(game_id, game.state, plan))
+
+
+@app.route("/api/winprob/<game_id>", methods=["POST"])
+def win_probability(game_id: str):
+    """Cheap win-probability for the current position (one solve per sampled
+    world, no per-move loop). Use this for the readout while stepping; it's
+    much faster than the full per-move /api/analyze."""
+    game = GAMES.get(game_id)
+    if game is None:
+        return jsonify({"error": "unknown game"}), 404
+    data = request.get_json(silent=True) or {}
+    samples = int(data.get("samples", MC_SAMPLES))
+    budget = int(data.get("budget", MC_SOLVE_BUDGET))
+    time_budget = float(data.get("timeBudget", MC_TIME_BUDGET_S))
+
+    est = mc_position_estimate(game.state, samples=samples, solve_budget=budget,
+                               time_budget_s=time_budget)
+    return jsonify({
+        "gameId": game_id,
+        "winProbability": est["winProbability"],
+        "winMargin": est.get("winMargin", 0.0),
+        "exact": est.get("exact", False),
+        "mode": est.get("mode"),
+        "samples": est["samples"],
+        "timedOut": est.get("timedOut", False),
+        "won": est.get("won", False),
+        "gameOver": est["gameOver"],
+    })
+
+
+@app.route("/api/analyze/<game_id>", methods=["POST"])
+def analyze(game_id: str):
+    """On-demand Monte Carlo analysis of the current position. Returns an
+    estimated win probability and a per-move win-rate breakdown. Does not
+    change the game or require mc_mode."""
+    game = GAMES.get(game_id)
+    if game is None:
+        return jsonify({"error": "unknown game"}), 404
+    data = request.get_json(silent=True) or {}
+    samples = int(data.get("samples", MC_SAMPLES))
+    budget = int(data.get("budget", MC_SOLVE_BUDGET))
+    time_budget = float(data.get("timeBudget", MC_TIME_BUDGET_S))
+
+    est = mc_estimate(game.state, samples=samples, solve_budget=budget,
+                      time_budget_s=time_budget)
+    return jsonify({
+        "gameId": game_id,
+        "winProbability": est["winProbability"],
+        "winMargin": est.get("winMargin", 0.0),
+        "exact": est.get("exact", False),
+        "mode": est.get("mode"),
+        "samples": est["samples"],
+        "timedOut": est.get("timedOut", False),
+        "won": est.get("won", False),
+        "gameOver": est["gameOver"],
+        "perMove": est["perMove"],
+        "best": est["best"],
+        "state": serialize_state(game.state),
+    })
+
+
+@app.route("/api/mcmode/<game_id>", methods=["POST"])
+def set_mc_mode(game_id: str):
+    """Toggle whether Monte Carlo drives the step recommendations for this game
+    (vs. the fast greedy planner). Body: {"on": true|false}."""
+    game = GAMES.get(game_id)
+    if game is None:
+        return jsonify({"error": "unknown game"}), 404
+    data = request.get_json(force=True)
+    game.mc_mode = bool(data.get("on", False))
+    # Recompute the current recommendation under the new mode so the UI updates.
+    plan = _compute_plan(game, n=3)
+    resp = _plan_response(game_id, game.state, plan)
+    resp["mcMode"] = game.mc_mode
+    return jsonify(resp)
 
 
 @app.route("/api/games", methods=["GET"])

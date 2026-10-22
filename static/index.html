@@ -65,9 +65,16 @@
         </div>
         <ol id="stepsList" class="steps-list"></ol>
         <div class="solve-actions">
+          <button id="undoBtn" disabled>Undo</button>
           <button id="refreshStepsBtn">Recompute steps</button>
+          <button id="analyzeBtn">Analyze (Monte Carlo)</button>
+          <label class="mc-toggle">
+            <input type="checkbox" id="mcModeToggle" />
+            MC drives recommendations
+          </label>
           <button id="resetBtn" class="ghost">New game</button>
         </div>
+        <p id="mcInfo" class="mc-info"></p>
         <p id="solveStatus" class="status"></p>
       </div>
     </section>

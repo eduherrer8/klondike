@@ -359,6 +359,218 @@ def check_stock_peel_reachability():
     print("stock peel reachability: OK")
 
 
+def check_monte_carlo():
+    """Monte Carlo should estimate a sensible win probability and pick a best
+    move. On an always-winnable end position it should report ~100%."""
+    import random as _r
+
+    from solver.resolver import build_opaque_state, parse_midgame
+    from solver.montecarlo import estimate
+
+    order = ["A", "2", "3", "4", "5", "6", "7", "8", "9", "10", "J", "Q", "K"]
+    def exp(s, t):
+        return [f"{r}{s}" for r in order[:order.index(t) + 1]]
+    # H,D complete; S to 10 (need J,Q,K), C to J (need Q,K). Remaining: JS QS KS QC KC.
+    fo = {"S": exp("S", "10"), "H": exp("H", "K"), "D": exp("D", "K"), "C": exp("C", "J")}
+    cols = [["?", "JS"], ["?", "QS"], ["KC"], [], [], [], []]  # hidden pool {KS, QC}
+    layout = parse_midgame(cols, [], foundations=fo, waste=[], draw_count=3)
+    st = build_opaque_state(layout)
+
+    est = estimate(st, samples=12, solve_budget=40_000, rng=_r.Random(0))
+    assert est["winProbability"] == 1.0, est["winProbability"]
+    assert est["best"] is not None
+    assert est["perMove"] and est["perMove"][0]["winRate"] == 1.0
+    # Only 2 hidden cards -> exhaustive & exact, so no sampling margin.
+    assert est["exact"] is True, est.get("mode")
+    assert est["winMargin"] == 0.0, est["winMargin"]
+    assert est["perMove"][0]["margin"] == 0.0
+    print(f"monte carlo: OK, winProb={est['winProbability']:.2f} (exact)")
+
+
+def check_mc_position_estimate_and_forced():
+    """The cheap position estimate agrees with the per-move estimate's win
+    probability, and a single-legal-move position is pruned (forced)."""
+    import random as _r
+
+    from solver.cards import Card
+    from solver.game import GameState
+    from solver.montecarlo import estimate, position_estimate
+
+    order = ["A", "2", "3", "4", "5", "6", "7", "8", "9", "10", "J", "Q", "K"]
+
+    # Single legal move -> forced pruning, exact, winProb 1.0.
+    gs = GameState(draw_count=3)
+    for s in ("H", "D", "C"):
+        gs.foundations[s] = [Card.parse(f"{r}{s}") for r in order]
+    gs.foundations["S"] = [Card.parse(f"{r}S") for r in order[:12]]  # A..Q
+    gs.tableau[0] = [(Card.parse("KS"), True)]
+    e = estimate(gs, samples=10, solve_budget=20_000)
+    assert e.get("forced") is True, e
+    assert e["winProbability"] == 1.0 and e["exact"]
+
+    # Position estimate matches on an exhaustive (exact) 2-hidden position.
+    def exp(s, t):
+        return [f"{r}{s}" for r in order[:order.index(t) + 1]]
+    from solver.resolver import build_opaque_state, parse_midgame
+    fo = {"S": exp("S", "10"), "H": exp("H", "K"), "D": exp("D", "K"), "C": exp("C", "J")}
+    cols = [["?", "JS"], ["?", "QS"], ["KC"], [], [], [], []]
+    st = build_opaque_state(parse_midgame(cols, [], foundations=fo, waste=[]))
+    pos = position_estimate(st, samples=10, solve_budget=40_000, rng=_r.Random(0))
+    full = estimate(st, samples=10, solve_budget=40_000, rng=_r.Random(0))
+    assert pos["winProbability"] == full["winProbability"], (pos, full)
+    assert pos["exact"] and full["exact"]
+    print("mc position estimate + forced pruning: OK")
+
+
+def check_mc_reports_dead_stock_cycle():
+    """Monte Carlo must report game over on a dead stock cycle, the same as the
+    greedy planner (not recommend a pointless 'Draw')."""
+    from solver.resolver import build_opaque_state, parse_midgame
+    from solver.montecarlo import estimate, mc_plan_steps, position_estimate
+    from solver.strategy import is_dead_stock_cycle
+
+    def exp(s, t):
+        order = ["A", "2", "3", "4", "5", "6", "7", "8", "9", "10", "J", "Q", "K"]
+        return [f"{r}{s}" for r in order[:order.index(t) + 1]]
+    fo = {"D": exp("D", "2"), "S": exp("S", "A"), "H": exp("H", "4")}
+    cols = [
+        ["KD", "QS", "JH", "10C", "9D", "8C", "7D", "6S", "5H", "4C"],
+        ["KC", "QD"], ["KS"],
+        ["?", "8D", "7C", "6D", "5C", "4D", "3C"],
+        ["?", "?", "?", "QC", "JD"], ["?", "?", "3S"],
+        ["?", "?", "?", "?", "7H"],
+    ]
+    stock = "6C KH 9S 6H JC 5D 10H 10D 9C 8H 8S 2C".split()
+    st = build_opaque_state(parse_midgame(cols, stock, foundations=fo, waste=[]))
+
+    assert is_dead_stock_cycle(st)
+    r = mc_plan_steps(st, n=3, samples=10, solve_budget=40_000, time_budget_s=10)
+    assert r["gameOver"] and r.get("stuck"), r
+    assert r["steps"] == []
+    assert estimate(st, samples=10, solve_budget=40_000)["gameOver"]
+    assert position_estimate(st, samples=10, solve_budget=40_000)["gameOver"]
+    print("mc reports dead stock cycle: OK")
+
+
+def check_unsafe_foundation_beats_dead_draw():
+    """A productive foundation play must be chosen over looping the stock, even
+    when the play is 'unsafe' by the conservative rule. Regression for a real
+    position where greedy looped forever on 'Draw 3' instead of playing 3H."""
+    from solver.resolver import build_opaque_state, parse_midgame
+    from solver.strategy import plan_steps
+
+    def exp(s, t):
+        order = ["A", "2", "3", "4", "5", "6", "7", "8", "9", "10", "J", "Q", "K"]
+        return [f"{r}{s}" for r in order[:order.index(t) + 1]]
+    fo = {"D": exp("D", "2"), "S": exp("S", "A"), "H": exp("H", "2"), "C": exp("C", "3")}
+    cols = [
+        ["KD", "QC", "JD", "10S"], ["KC", "QD", "JS"], ["KS"],
+        ["?", "8D", "7C", "6D", "5C", "4D"], [],
+        ["?", "?", "?", "QS", "JH", "10C", "9D", "8C", "7D", "6S", "5H", "4C", "3H"],
+        ["?", "?", "?", "?", "7H"],
+    ]
+    stock = "6C KH 9S 6H JC 5D 10H 10D 9C 8H 8S 4H".split()
+    st = build_opaque_state(parse_midgame(cols, stock, foundations=fo, waste=[]))
+
+    p = plan_steps(st, n=3)
+    assert not p["gameOver"]
+    assert p["steps"], "should recommend a productive move, not loop"
+    first = p["steps"][0]
+    assert first["move"]["kind"] != "draw", first  # must not loop on draw
+    assert "3H" in first["description"], first
+    print("unsafe foundation beats dead draw: OK")
+
+
+def check_exact_win_plan():
+    """A proven win returns a guaranteed exact plan; an uncertain position does
+    not."""
+    from solver.cards import Card, UNKNOWN, full_deck
+    from solver.game import GameState
+    from solver.resolver import build_opaque_state, parse_midgame
+    from solver.montecarlo import exact_win_plan
+    import random as _r
+
+    order = ["A", "2", "3", "4", "5", "6", "7", "8", "9", "10", "J", "Q", "K"]
+
+    # Fully-known guaranteed win.
+    gs = GameState(draw_count=3)
+    for s in ("S", "H", "D", "C"):
+        gs.foundations[s] = [Card.parse(f"{r}{s}") for r in order[:12]]
+    for i, s in enumerate(("S", "H", "D", "C")):
+        gs.tableau[i] = [(Card.parse(f"K{s}"), True)]
+    p = exact_win_plan(gs, n=3)
+    assert p is not None and p["exactGuaranteed"] and p["winProbability"] == 1.0
+
+    # Hidden but every arrangement wins -> still guaranteed.
+    def exp(s, t):
+        return [f"{r}{s}" for r in order[:order.index(t) + 1]]
+    fo = {"S": exp("S", "J"), "H": exp("H", "K"), "D": exp("D", "K"), "C": exp("C", "K")}
+    st = build_opaque_state(parse_midgame([["?", "QS"], [], [], [], [], [], []],
+                                          [], foundations=fo, waste=[]))
+    p2 = exact_win_plan(st, n=3)
+    assert p2 is not None and p2["exactGuaranteed"]
+
+    # Many hidden -> not provable, returns None.
+    rng = _r.Random(1); deck = full_deck(); rng.shuffle(deck)
+    gs3 = GameState(draw_count=3); idx = 0
+    for n in range(1, 8):
+        gs3.tableau[n - 1] = [(deck[idx + i], i == n - 1) for i in range(n)]; idx += n
+    gs3.stock = deck[idx:][::-1]
+    for col in gs3.tableau:
+        for pi, (c, up) in enumerate(col):
+            if not up:
+                col[pi] = (UNKNOWN, False)
+    assert exact_win_plan(gs3, n=3) is None
+    print("exact win plan: OK")
+
+
+def check_mc_confidence_interval():
+    """When sampling (not exhaustive), estimates carry a non-zero confidence
+    margin; the Wilson interval is sane (0 <= margin <= ~0.5)."""
+    from solver.montecarlo import _wilson_interval, _choose_effort
+
+    # Wilson interval basics.
+    p, margin, _ = _wilson_interval(5, 10)
+    assert 0.0 < margin < 0.5, margin
+    p0, m0, _ = _wilson_interval(0, 0)  # no trials -> fully uncertain
+    assert m0 == 1.0
+    # Must never produce a complex result, even on degenerate inputs such as
+    # wins > trials (which previously crashed with a complex-vs-float compare).
+    for w, t in [(11, 10), (5, 5), (0, 5), (3, 4), (1, 1)]:
+        pp, mm, _ = _wilson_interval(w, t)
+        assert isinstance(pp, float) and isinstance(mm, float)
+        assert 0.0 <= pp <= 1.0 and 0.0 <= mm <= 1.0, (w, t, pp, mm)
+
+    # Adaptive effort: tiny arrangement spaces enumerate exactly; big ones sample.
+    assert _choose_effort(2, 60)["mode"] == "exhaustive"
+    assert _choose_effort(10, 60)["mode"] == "sampled"
+    assert _choose_effort(20, 60)["mode"] == "sampled"
+    assert _choose_effort(10, 60)["samples"] >= 40
+
+    # Regression: a tiny time budget forces mid-world aborts; this must not
+    # leave wins > evaluated (which crashed the CI math). Run a heavy position.
+    import random as _r
+
+    from solver.cards import UNKNOWN, full_deck
+    from solver.game import GameState
+    from solver.montecarlo import estimate as _estimate
+
+    rng = _r.Random(1); deck = full_deck(); rng.shuffle(deck)
+    gs = GameState(draw_count=3); idx = 0
+    for n in range(1, 8):
+        gs.tableau[n - 1] = [(deck[idx + i], i == n - 1) for i in range(n)]; idx += n
+    gs.stock = deck[idx:][::-1]
+    for col in gs.tableau:
+        for pi, (c, up) in enumerate(col):
+            if not up:
+                col[pi] = (UNKNOWN, False)
+    res = _estimate(gs, samples=40, solve_budget=30_000, time_budget_s=0.5)
+    for pm in res["perMove"]:
+        assert pm["wins"] <= pm["trials"], pm  # never more wins than trials
+        assert isinstance(pm["winRate"], float)
+    print("mc confidence interval + adaptivity: OK")
+
+
 def check_game_over_only_when_no_moves():
     """Game over must require zero legal moves, not merely 'no proven win'."""
     from solver.engine import legal_moves
@@ -389,5 +601,11 @@ if __name__ == "__main__":
     check_strategy_keeps_playing_after_reveal()
     check_dead_stock_cycle()
     check_stock_peel_reachability()
+    check_monte_carlo()
+    check_mc_position_estimate_and_forced()
+    check_mc_reports_dead_stock_cycle()
+    check_unsafe_foundation_beats_dead_draw()
+    check_exact_win_plan()
+    check_mc_confidence_interval()
     check_game_over_only_when_no_moves()
     print("\nAll sanity checks passed.")

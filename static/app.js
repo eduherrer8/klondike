@@ -244,18 +244,21 @@ function renderBoard(state) {
 }
 
 async function loadSteps() {
-  const status = document.getElementById("solveStatus");
-  status.textContent = "Computing next steps\u2026";
-  status.className = "status";
-  const res = await fetch(`/api/steps/${gameId}?n=3`);
-  const data = await res.json();
-  applyStepsResponse(data);
+  setBusy(true, "Computing next steps\u2026");
+  try {
+    const res = await fetch(`/api/steps/${gameId}?n=3`);
+    const data = await res.json();
+    applyStepsResponse(data);
+  } finally {
+    setBusy(false);
+  }
 }
 
 function applyStepsResponse(data) {
   const status = document.getElementById("solveStatus");
   const info = document.getElementById("planInfo");
   if (data.state) renderBoard(data.state);
+  updateUndoButton(data.canUndo);
 
   // Won.
   if (data.solved || (data.state && data.state.won)) {
@@ -278,14 +281,50 @@ function applyStepsResponse(data) {
   // Otherwise we have recommended steps.
   currentSteps = data.steps || [];
   const hidden = data.state ? data.state.faceDownCount : 0;
-  info.textContent = hidden
+  const src = data.mc ? "Monte Carlo" : "greedy";
+  info.textContent = (hidden
     ? `${hidden} face-down card${hidden === 1 ? "" : "s"} remaining`
-    : "";
+    : "") + ` \u00b7 ${src}`;
+  // Proven win: show the guarantee and skip any probability estimation.
+  if (data.exactGuaranteed) {
+    const mcInfo = document.getElementById("mcInfo");
+    mcInfo.textContent = "\u2705 Guaranteed win \u2014 following the solved line.";
+    mcInfo.className = "mc-info guaranteed";
+  } else if (data.mc && typeof data.winProbability === "number") {
+    // When the plan came from Monte Carlo, keep the win-probability readout fresh.
+    renderMcResult(data);
+  } else if (!data.gameOver && !data.solved) {
+    // Greedy mode: fetch the CHEAP position win-probability in the background
+    // so the readout appears without the cost of the per-move analysis.
+    fetchWinProb();
+  }
   status.textContent = data.revealNext
     ? "The next move flips a face-down card \u2014 accept it, then tell me what it is."
     : "";
   status.className = "status";
   renderSteps(currentSteps);
+}
+
+async function fetchWinProb() {
+  if (!gameId) return;
+  const mcInfo = document.getElementById("mcInfo");
+  mcInfo.textContent = "Estimating win probability\u2026";
+  mcInfo.className = "mc-info working";
+  const gid = gameId;
+  try {
+    const res = await fetch(`/api/winprob/${gid}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({}),
+    });
+    if (gid !== gameId) return;  // state moved on; drop stale result
+    const data = await res.json();
+    if (!res.ok) { mcInfo.textContent = ""; mcInfo.className = "mc-info"; return; }
+    // Position estimate has no per-move breakdown; render just the probability.
+    renderMcResult({ ...data, perMove: [] });
+  } catch (e) {
+    mcInfo.textContent = ""; mcInfo.className = "mc-info";
+  }
 }
 
 function renderSteps(steps) {
@@ -314,7 +353,7 @@ function renderSteps(steps) {
       const accept = document.createElement("button");
       accept.className = "accept";
       accept.textContent = "Accept";
-      accept.onclick = () => acceptStep(step.move);
+      accept.onclick = () => acceptStep(step);
       const reject = document.createElement("button");
       reject.className = "reject";
       reject.textContent = "Reject";
@@ -327,18 +366,66 @@ function renderSteps(steps) {
   });
 }
 
-async function acceptStep(move) {
-  const res = await fetch(`/api/accept/${gameId}`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ move }),
+// ---- busy indicator ----
+
+let busyDepth = 0;
+
+function setBusy(on, message) {
+  busyDepth = Math.max(0, busyDepth + (on ? 1 : -1));
+  const active = busyDepth > 0;
+  document.body.classList.toggle("busy", active);
+  // Disable in-flight-sensitive buttons while a request runs. "New game"
+  // (resetBtn) stays enabled so the user can always bail out.
+  ["undoBtn", "refreshStepsBtn", "analyzeBtn"].forEach((id) => {
+    const el = document.getElementById(id);
+    if (el) el.disabled = active;
   });
-  const data = await res.json();
-  if (!res.ok) {
-    document.getElementById("solveStatus").textContent = data.error || "Move rejected by server.";
-    return;
+  document.querySelectorAll(".step .actions button").forEach((b) => { b.disabled = active; });
+  if (active && message) {
+    const status = document.getElementById("solveStatus");
+    status.innerHTML = `<span class="spinner"></span>${message}`;
+    status.className = "status working";
+  }
+}
+
+async function acceptStep(step) {
+  const move = step.move;
+  // Skip the (possibly expensive) recompute for a plain DRAW: it only moves
+  // known stock to the waste, reveals nothing, and doesn't change the planned
+  // continuation — so the precomputed steps 2..n are still exactly right.
+  // (Other move types can change the best line, and a reveal invalidates the
+  // rest of the plan, so those always recompute.)
+  const remaining = currentSteps.slice(1);
+  const canSkip = move.kind === "draw" && !step.revealsHidden && remaining.length > 0;
+
+  setBusy(true, "Applying the move\u2026");
+  let data;
+  try {
+    const res = await fetch(`/api/accept/${gameId}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ move, skipPlan: canSkip }),
+    });
+    data = await res.json();
+    if (!res.ok) {
+      document.getElementById("solveStatus").textContent = data.error || "Move rejected by server.";
+      return;
+    }
+  } finally {
+    setBusy(false);
   }
   renderBoard(data.state);
+
+  // Fast path: reuse the precomputed continuation, no recompute needed.
+  if (data.skippedPlan) {
+    updateUndoButton(data.canUndo);
+    currentSteps = remaining;
+    renderSteps(currentSteps);
+    const status = document.getElementById("solveStatus");
+    status.textContent = "";
+    status.className = "status";
+    return;
+  }
 
   // If this move flipped a face-down card, ask the user what it really is.
   // Keep asking until a valid card is entered (or the user cancels), so a
@@ -350,16 +437,23 @@ async function acceptStep(move) {
       const real = await promptRevealedCard(col, errorHint);
       if (!real) {
         document.getElementById("solveStatus").textContent =
-          "Flip revealed a card \u2014 tell me what it is to continue.";
+          "Flip revealed a card \u2014 tell me what it is to continue. (You can also Undo.)";
         return;
       }
-      const rres = await fetch(`/api/reveal/${gameId}`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ col, card: real }),
-      });
-      const rdata = await rres.json();
-      if (rres.ok) {
+      setBusy(true, "Updating with the revealed card\u2026");
+      let rdata, ok;
+      try {
+        const rres = await fetch(`/api/reveal/${gameId}`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ col, card: real }),
+        });
+        ok = rres.ok;
+        rdata = await rres.json();
+      } finally {
+        setBusy(false);
+      }
+      if (ok) {
         applyStepsResponse(rdata);
         return;
       }
@@ -385,19 +479,22 @@ function promptRevealedCard(col, errorHint) {
 }
 
 async function rejectStep(move) {
-  const status = document.getElementById("solveStatus");
-  status.textContent = "Finding an alternative move\u2026";
-  const res = await fetch(`/api/reject/${gameId}`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ move, n: 3 }),
-  });
-  const data = await res.json();
-  if (!res.ok) {
-    status.textContent = data.error || "Could not find an alternative.";
-    return;
+  setBusy(true, "Finding an alternative move\u2026");
+  try {
+    const res = await fetch(`/api/reject/${gameId}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ move, n: 3 }),
+    });
+    const data = await res.json();
+    if (!res.ok) {
+      document.getElementById("solveStatus").textContent = data.error || "Could not find an alternative.";
+      return;
+    }
+    applyStepsResponse(data);
+  } finally {
+    setBusy(false);
   }
-  applyStepsResponse(data);
 }
 
 function resetGame() {
@@ -406,6 +503,118 @@ function resetGame() {
   document.getElementById("solve").classList.add("hidden");
   document.getElementById("setup").classList.remove("hidden");
   document.getElementById("solveStatus").textContent = "";
+  document.getElementById("mcInfo").textContent = "";
+  document.getElementById("mcModeToggle").checked = false;
+  updateUndoButton(false);
+}
+
+// ---- undo ----
+
+async function undoMove() {
+  if (!gameId) return;
+  const res = await fetch(`/api/undo/${gameId}`, { method: "POST" });
+  const data = await res.json();
+  if (!res.ok) {
+    document.getElementById("solveStatus").textContent = data.error || "Could not undo.";
+    return;
+  }
+  applyStepsResponse(data);
+  if (data.message === "Nothing to undo.") {
+    document.getElementById("solveStatus").textContent = "Nothing to undo.";
+  } else {
+    document.getElementById("solveStatus").textContent = "Undid the last move.";
+  }
+}
+
+function updateUndoButton(canUndo) {
+  const btn = document.getElementById("undoBtn");
+  if (btn) btn.disabled = !canUndo;
+}
+
+// ---- Monte Carlo ----
+
+async function analyzeMonteCarlo() {
+  if (!gameId) return;
+  const mcInfo = document.getElementById("mcInfo");
+  mcInfo.textContent = "Running Monte Carlo analysis\u2026 (this can take a few seconds)";
+  mcInfo.className = "mc-info working";
+  const btn = document.getElementById("analyzeBtn");
+  btn.disabled = true;
+  try {
+    const res = await fetch(`/api/analyze/${gameId}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({}),
+    });
+    const data = await res.json();
+    if (!res.ok) {
+      mcInfo.textContent = data.error || "Analysis failed.";
+      mcInfo.className = "mc-info";
+      return;
+    }
+    renderMcResult(data);
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+function fmtProb(rate, margin, exact) {
+  const pct = Math.round((rate || 0) * 100);
+  if (exact) return `${pct}%`;
+  if (typeof margin === "number" && margin > 0) {
+    return `${pct}% \u00b1 ${Math.round(margin * 100)}%`;
+  }
+  return `${pct}%`;
+}
+
+function renderMcResult(data) {
+  const mcInfo = document.getElementById("mcInfo");
+  const winProbability = data.winProbability;
+  const margin = data.winMargin;
+  const exact = data.exact;
+  const samples = data.samples;
+  const perMove = data.perMove;
+  const timedOut = data.timedOut;
+
+  const head = exact
+    ? `Win probability: ${fmtProb(winProbability, 0, true)} (exact \u2014 all layouts checked)`
+    : `Estimated win probability: ${fmtProb(winProbability, margin, false)} ` +
+      `(${samples} sampled layouts${timedOut ? ", time-limited" : ""})`;
+  const lines = [head];
+  if (perMove && perMove.length) {
+    const top = perMove.slice(0, 4)
+      .map((m) => `${fmtProb(m.winRate, m.margin, exact)} \u2014 ${m.description}`);
+    lines.push("Best moves: " + top.join("  |  "));
+  }
+  mcInfo.textContent = lines.join("\n");
+  const pct = Math.round((winProbability || 0) * 100);
+  mcInfo.className = "mc-info" + (pct === 0 ? " zero" : "");
+}
+
+async function toggleMcMode(on) {
+  if (!gameId) return;
+  const mcInfo = document.getElementById("mcInfo");
+  mcInfo.textContent = on
+    ? "Monte Carlo now drives recommendations (slower, stronger)\u2026"
+    : "";
+  mcInfo.className = "mc-info working";
+  const res = await fetch(`/api/mcmode/${gameId}`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ on }),
+  });
+  const data = await res.json();
+  if (!res.ok) {
+    mcInfo.textContent = data.error || "Could not change mode.";
+    return;
+  }
+  applyStepsResponse(data);
+  if (data.mc) {
+    renderMcResult(data);
+  } else {
+    mcInfo.textContent = "";
+    mcInfo.className = "mc-info";
+  }
 }
 
 // ---- wire up ----
@@ -417,4 +626,7 @@ document.addEventListener("DOMContentLoaded", () => {
   document.getElementById("fillSampleBtn").onclick = fillSample;
   document.getElementById("refreshStepsBtn").onclick = loadSteps;
   document.getElementById("resetBtn").onclick = resetGame;
+  document.getElementById("analyzeBtn").onclick = analyzeMonteCarlo;
+  document.getElementById("mcModeToggle").onchange = (e) => toggleMcMode(e.target.checked);
+  document.getElementById("undoBtn").onclick = undoMove;
 });

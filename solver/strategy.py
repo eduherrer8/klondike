@@ -99,12 +99,14 @@ def move_score(state: GameState, move: Move) -> float:
 
     if move.kind in ("to_foundation", "waste_to_foundation"):
         card = _move_card(state, move)
-        # Conservative: only reward safe foundation plays; penalize unsafe ones
-        # so the planner holds cards back (option a).
+        # Conservative (option a): strongly prefer SAFE foundation plays; only
+        # mildly discourage unsafe ones. The discouragement must stay ABOVE a
+        # draw's score, so an unsafe foundation play is still chosen over
+        # looping the stock when it's the only way to make progress.
         if card is not None and is_safe_to_foundation(state, card):
             score += 6.0
         else:
-            score -= 4.0
+            score += 0.5  # mild: better than a dead draw, worse than safe plays
 
     if move.kind in ("tableau", "to_foundation") and flips_hidden_card(state, move):
         score += 12.0  # exposing a hidden card is the highest-value action
