@@ -1,0 +1,209 @@
+:root {
+  --green: #1b7a3d;
+  --green-dark: #14562b;
+  --card-bg: #fff;
+  --card-border: #c9c9c9;
+  --red: #c0392b;
+  --black: #222;
+  --panel: #ffffff;
+  --accent: #2d6cdf;
+  --bg: #0e3a21;
+}
+
+* { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  background: var(--bg);
+  color: #1c1c1c;
+}
+
+header {
+  padding: 20px 28px 10px;
+  color: #eafff0;
+}
+header h1 { margin: 0; font-size: 26px; }
+.subtitle { margin: 4px 0 0; opacity: 0.8; font-size: 14px; }
+
+main {
+  padding: 16px 28px 48px;
+  max-width: 1100px;
+  margin: 0 auto;
+}
+
+.panel {
+  background: var(--panel);
+  border-radius: 12px;
+  padding: 20px 22px;
+  margin-bottom: 20px;
+  box-shadow: 0 6px 20px rgba(0,0,0,0.25);
+}
+.panel h2 { margin-top: 0; }
+.hidden { display: none; }
+
+.hint { font-size: 13px; color: #555; line-height: 1.5; }
+code {
+  background: #eef0f3; padding: 1px 5px; border-radius: 4px;
+  font-size: 12px;
+}
+
+.columns-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+  gap: 10px;
+  margin: 14px 0;
+}
+.foundations-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+  gap: 10px;
+  margin: 10px 0 14px;
+}
+.section-title {
+  margin: 18px 0 2px;
+  font-size: 15px;
+  border-top: 1px solid #eceef2;
+  padding-top: 14px;
+}
+.field { display: flex; flex-direction: column; gap: 4px; font-size: 13px; }
+.field span { font-weight: 600; color: #333; }
+.field input {
+  padding: 8px 10px; border: 1px solid #ccc; border-radius: 6px;
+  font-family: ui-monospace, Menlo, monospace; font-size: 13px;
+}
+
+.setup-actions { display: flex; gap: 10px; margin-top: 16px; flex-wrap: wrap; }
+
+button {
+  border: none; border-radius: 8px; padding: 9px 16px;
+  font-size: 14px; cursor: pointer; background: #e7e9ee; color: #222;
+  transition: background 0.15s;
+}
+button:hover { background: #d6d9e0; }
+button.primary { background: var(--accent); color: #fff; }
+button.primary:hover { background: #255bc0; }
+button.ghost { background: transparent; color: #666; }
+button.accept { background: #1f9d55; color: #fff; }
+button.accept:hover { background: #178046; }
+button.reject { background: #d64545; color: #fff; }
+button.reject:hover { background: #b83636; }
+button:disabled { opacity: 0.5; cursor: not-allowed; }
+
+.error { color: #ffb4a8; font-size: 13px; min-height: 16px; }
+.panel .error { color: var(--red); }
+
+/* Board */
+.board {
+  background: var(--green);
+  border-radius: 10px;
+  padding: 16px;
+  display: grid;
+  gap: 16px;
+  margin-bottom: 18px;
+}
+.top-row { display: flex; justify-content: space-between; gap: 12px; }
+.foundations, .stock-waste { display: flex; gap: 8px; }
+
+.tableau {
+  display: grid;
+  grid-template-columns: repeat(7, 1fr);
+  gap: 8px;
+}
+.column {
+  min-height: 120px;
+  display: flex;
+  flex-direction: column;
+}
+.col-label { text-align: center; color: #cdeccf; font-size: 11px; margin-bottom: 2px; }
+
+.card {
+  width: 54px; height: 74px;
+  background: var(--card-bg);
+  border: 1px solid var(--card-border);
+  border-radius: 6px;
+  display: flex; align-items: center; justify-content: center;
+  font-weight: 700; font-size: 16px;
+  box-shadow: 0 1px 2px rgba(0,0,0,0.3);
+  margin-top: -52px;   /* default: face-down cards show a ~22px strip */
+}
+.column .card:first-child { margin-top: 0; }
+/* Inside a column, show each card's value in the TOP-LEFT corner so a thin
+   visible strip is enough to read it when cards are fanned/overlapped. */
+.column .card {
+  align-items: flex-start;
+  justify-content: flex-start;
+  padding: 4px 0 0 6px;
+}
+/* Face-up cards overlap by just enough to keep the top-left index visible. */
+.column .card.faceup { margin-top: -46px; }
+/* The very first card, even if face-up (single-card column), sits flush. */
+.column .card.faceup:first-child { margin-top: 0; }
+/* The last (front) card in a column is fully exposed. */
+.column .card:last-child { margin-bottom: 0; }
+.card.red { color: var(--red); }
+.card.black { color: var(--black); }
+.card.facedown {
+  background: repeating-linear-gradient(45deg, #2b4c8c, #2b4c8c 6px, #3a5ea8 6px, #3a5ea8 12px);
+  color: transparent;
+}
+.card.slot {
+  background: rgba(255,255,255,0.12);
+  border: 2px dashed rgba(255,255,255,0.4);
+  box-shadow: none;
+}
+.card.unknown {
+  background: #fff6d6;
+  border: 2px solid #e0a800;
+  color: #8a6d00;
+  font-size: 22px;
+}
+.card.mini { width: 48px; height: 66px; font-size: 14px; margin-top: 0; }
+
+.pile-wrap { display: flex; flex-direction: column; align-items: center; gap: 2px; }
+.pile-wrap small { color: #cdeccf; font-size: 10px; }
+
+/* Waste fan: the current draw shown fanned horizontally; only the last card
+   (rightmost) is playable. Values sit top-left so overlapped cards stay
+   readable. */
+.waste-fan { display: flex; }
+.waste-fan .card {
+  margin-left: -24px;
+  align-items: flex-start;
+  justify-content: flex-start;
+  padding: 4px 0 0 5px;
+}
+.waste-fan .card:first-child { margin-left: 0; }
+.waste-fan .card.waste-top-playable {
+  box-shadow: 0 0 0 2px #2d6cdf, 0 1px 3px rgba(0,0,0,0.4);
+  z-index: 2;
+}
+
+/* Steps */
+.steps-header { display: flex; align-items: baseline; gap: 12px; }
+.plan-info { font-size: 13px; color: #555; }
+.steps-list { list-style: none; padding: 0; margin: 12px 0; display: flex; flex-direction: column; gap: 10px; }
+.step {
+  border: 1px solid #e2e4ea; border-radius: 10px; padding: 12px 14px;
+  display: flex; align-items: center; justify-content: space-between; gap: 12px;
+  background: #fbfcfe;
+}
+.step.pending-next { border-color: var(--accent); box-shadow: 0 0 0 2px rgba(45,108,223,0.15); }
+.step .desc { font-size: 14px; }
+.step .num { font-weight: 700; color: var(--accent); margin-right: 8px; }
+.reveal-badge {
+  display: inline-block;
+  margin-left: 8px;
+  padding: 1px 7px;
+  font-size: 11px;
+  font-weight: 700;
+  color: #8a6d00;
+  background: #fff6d6;
+  border: 1px solid #e0a800;
+  border-radius: 10px;
+}
+.step .actions { display: flex; gap: 8px; }
+.solve-actions { display: flex; gap: 10px; margin-top: 8px; }
+.status { font-size: 13px; color: #444; min-height: 18px; }
+.status.win { color: var(--green-dark); font-weight: 700; }
+.status.gameover { color: var(--red); font-weight: 700; }

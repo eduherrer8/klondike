@@ -1,0 +1,78 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Solitaire Solver</title>
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <header>
+    <h1>Solitaire Solver</h1>
+    <p class="subtitle">Klondike · 7 columns · draw 3 · Kings to empty columns</p>
+  </header>
+
+  <main>
+    <!-- SETUP PHASE -->
+    <section id="setup" class="panel">
+      <h2>1. Set up the position</h2>
+      <p class="hint">
+        Enter cards as codes separated by spaces. Rank + suit letter
+        (<code>S H D C</code>): e.g. <code>AS</code>, <code>10H</code>,
+        <code>KC</code>, <code>7D</code>. Each column is bottom-first (the
+        last code is the top, playable card). Use <code>?</code> for a
+        <strong>face-down</strong> card you can't see. The hidden cards are
+        worked out automatically from everything else you enter.
+      </p>
+
+      <div class="columns-grid" id="columnInputs"></div>
+
+      <h3 class="section-title">Foundations (current top per suit)</h3>
+      <p class="hint">
+        Enter the cards already moved to each foundation, ascending from the
+        Ace. e.g. Diamonds <code>AD 2D 3D</code> if you're currently at 3&diams;.
+        Leave blank if empty.
+      </p>
+      <div class="foundations-grid" id="foundationInputs"></div>
+
+      <h3 class="section-title">Stock &amp; waste</h3>
+      <label class="field">
+        <span>Stock (the full fixed cycling sequence, draw order)</span>
+        <input type="text" id="stockInput" placeholder="e.g. 2C 9H 4H ..." />
+      </label>
+      <label class="field">
+        <span>Waste (cards currently fanned out, top card last) &mdash; optional</span>
+        <input type="text" id="wasteInput" placeholder="e.g. 10H KH 9D" />
+      </label>
+
+      <div class="setup-actions">
+        <button id="startBtn" class="primary">Solve</button>
+        <button id="fillSampleBtn">Fill example position</button>
+      </div>
+      <p id="setupError" class="error"></p>
+    </section>
+
+    <!-- SOLVE PHASE -->
+    <section id="solve" class="panel hidden">
+      <h2>2. Calibrate the solution</h2>
+
+      <div id="board" class="board"></div>
+
+      <div class="steps-area">
+        <div class="steps-header">
+          <h3>Next 3 steps</h3>
+          <span id="planInfo" class="plan-info"></span>
+        </div>
+        <ol id="stepsList" class="steps-list"></ol>
+        <div class="solve-actions">
+          <button id="refreshStepsBtn">Recompute steps</button>
+          <button id="resetBtn" class="ghost">New game</button>
+        </div>
+        <p id="solveStatus" class="status"></p>
+      </div>
+    </section>
+  </main>
+
+  <script src="app.js"></script>
+</body>
+</html>
