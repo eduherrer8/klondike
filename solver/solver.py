@@ -38,40 +38,131 @@ def _move_priority(move: Move) -> int:
 
 
 def solve(start: GameState, max_states: int = 200_000) -> list[Move] | None:
-    """Return a list of moves that wins, or None if not found within budget."""
+    """Return a list of moves that wins, or None if not found within budget.
+
+    Weighted best-first search with transposition pruning. Instead of carrying
+    the whole move list in every heap entry (an O(path) copy per push), each
+    node stores only its depth and a reference into a came-from map
+    (``prev[key] = (parent_key, move)``); the winning line is reconstructed by
+    walking that map once, only when a win is found. A closed set guarantees a
+    popped state is expanded at most once. All structures are LOCAL to this call
+    (no shared/global caches), so parallel/pickled worlds never interfere and
+    the search stays deterministic for a given start state.
+    """
     if start.is_won():
         return []
 
     counter = itertools.count()
     start_key = start.key()
-    # heap entries: (heuristic, tiebreak, state, path)
-    heap: list[tuple[int, int, GameState, list[Move]]] = []
-    heapq.heappush(heap, (_heuristic(start), next(counter), start, []))
+    # heap entries: (priority, tiebreak, depth, state, state_key)
+    heap: list[tuple[int, int, int, GameState, tuple]] = []
+    heapq.heappush(heap, (_heuristic(start), next(counter), 0, start, start_key))
+    # best_seen: shortest known depth to reach a key (transposition table).
     best_seen: dict[tuple, int] = {start_key: 0}
+    # came-from map for path reconstruction on a win (parent pointers).
+    prev: dict[tuple, tuple] = {start_key: (None, None)}
+    # closed set: keys already popped/expanded, never re-expanded.
+    closed: set[tuple] = set()
     explored = 0
 
     while heap and explored < max_states:
-        h, _, state, path = heapq.heappop(heap)
+        _, _, depth, state, state_key = heapq.heappop(heap)
+
+        # Skip stale heap entries (a better path to this key was found after
+        # this one was pushed) and anything already expanded.
+        if state_key in closed:
+            continue
+        closed.add(state_key)
         explored += 1
 
         if state.is_won():
-            return path
+            return _reconstruct(prev, state_key)
 
-        if len(path) > 400:  # avoid runaway lines
+        if depth > 400:  # avoid runaway lines
             continue
 
+        new_len = depth + 1
         for move in legal_moves(state):
             nxt = apply_move(state, move)
             key = nxt.key()
-            new_len = len(path) + 1
-            prev = best_seen.get(key)
-            if prev is not None and prev <= new_len:
+            # Prune duplicates before any heap work: skip if already expanded,
+            # or reachable at least as cheaply by a path we've already queued.
+            if key in closed:
+                continue
+            seen = best_seen.get(key)
+            if seen is not None and seen <= new_len:
+                continue
+            best_seen[key] = new_len
+            prev[key] = (state_key, move)
+            priority = _heuristic(nxt) + _move_priority(move) + new_len // 8
+            heapq.heappush(heap, (priority, next(counter), new_len, nxt, key))
+
+    return None
+
+
+def is_winnable(start: GameState, max_states: int = 200_000) -> bool:
+    """Boolean fast path: is `start` winnable within the state budget?
+
+    Same search as `solve` but without any path bookkeeping — no came-from map
+    and no reconstruction — since callers that only need yes/no (the Monte
+    Carlo `position_estimate` / `eval_world_winnable` worker) never use the move
+    list. Returns the SAME verdict as ``solve(...) is not None`` for a given
+    state (identical exploration order and pruning); it just skips building the
+    winning line. All structures are local to the call, so it is deterministic
+    and safe across parallel/pickled worlds.
+    """
+    if start.is_won():
+        return True
+
+    counter = itertools.count()
+    start_key = start.key()
+    heap: list[tuple[int, int, int, GameState, tuple]] = []
+    heapq.heappush(heap, (_heuristic(start), next(counter), 0, start, start_key))
+    best_seen: dict[tuple, int] = {start_key: 0}
+    closed: set[tuple] = set()
+    explored = 0
+
+    while heap and explored < max_states:
+        _, _, depth, state, state_key = heapq.heappop(heap)
+        if state_key in closed:
+            continue
+        closed.add(state_key)
+        explored += 1
+
+        if state.is_won():
+            return True
+        if depth > 400:
+            continue
+
+        new_len = depth + 1
+        for move in legal_moves(state):
+            nxt = apply_move(state, move)
+            key = nxt.key()
+            if key in closed:
+                continue
+            seen = best_seen.get(key)
+            if seen is not None and seen <= new_len:
                 continue
             best_seen[key] = new_len
             priority = _heuristic(nxt) + _move_priority(move) + new_len // 8
-            heapq.heappush(heap, (priority, next(counter), nxt, path + [move]))
+            heapq.heappush(heap, (priority, next(counter), new_len, nxt, key))
 
-    return None
+    return False
+
+
+def _reconstruct(prev: dict[tuple, tuple], goal_key: tuple) -> list[Move]:
+    """Walk the came-from map from the winning state back to the start and
+    return the moves in forward order."""
+    moves: list[Move] = []
+    key = goal_key
+    while True:
+        parent_key, move = prev[key]
+        if move is None:
+            break
+        moves.append(move)
+        key = parent_key
+    moves.reverse()
+    return moves
 
 
 def _steps_payload(solution: list[Move], n: int, total: int) -> dict:

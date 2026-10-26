@@ -571,6 +571,277 @@ def check_mc_confidence_interval():
     print("mc confidence interval + adaptivity: OK")
 
 
+def _heavy_hidden_state(seed: int = 1):
+    """A heavy mid-game position (~21 hidden cards) built from a shuffled deck.
+    Used by the parallel/racing regression checks."""
+    import random as _r
+
+    from solver.cards import UNKNOWN, full_deck
+    from solver.game import GameState
+
+    rng = _r.Random(seed)
+    deck = full_deck()
+    rng.shuffle(deck)
+    gs = GameState(draw_count=3)
+    idx = 0
+    for n in range(1, 8):
+        gs.tableau[n - 1] = [(deck[idx + i], i == n - 1) for i in range(n)]
+        idx += n
+    gs.stock = deck[idx:][::-1]
+    for col in gs.tableau:
+        for pi, (c, up) in enumerate(col):
+            if not up:
+                col[pi] = (UNKNOWN, False)
+    return gs
+
+
+def check_pickle_round_trip():
+    """GameState/Card/Move must survive a pickle round-trip, since the process
+    pool ships them across process boundaries. (macOS uses the 'spawn' start
+    method, so everything crossing the boundary must be picklable.)"""
+    import pickle
+
+    from solver.cards import UNKNOWN, Card
+    from solver.game import GameState, Move
+
+    gs = GameState(draw_count=3)
+    gs.tableau[0] = [(Card.parse("KS"), True), (UNKNOWN, False)]
+    gs.foundations["S"] = [Card.parse("AS")]
+    gs.stock = [Card.parse("2C"), Card.parse("3H")]
+    gs.waste = [Card.parse("4D")]
+    gs2 = pickle.loads(pickle.dumps(gs))
+    assert gs2.key() == gs.key(), "GameState must round-trip through pickle"
+
+    m = Move("tableau", src=0, dst=1, count=2, card="KS")
+    assert pickle.loads(pickle.dumps(m)) == m, "Move must round-trip"
+    c = Card.parse("10H")
+    assert pickle.loads(pickle.dumps(c)) == c, "Card must round-trip"
+    assert pickle.loads(pickle.dumps(UNKNOWN)) == UNKNOWN, "UNKNOWN must round-trip"
+    print("pickle round-trip: OK")
+
+
+def check_parallel_matches_sequential():
+    """Parallel estimate must agree with the sequential estimate on an
+    exhaustive (exact) position: same winProbability and same best move. On an
+    exact position both paths enumerate every arrangement, so results must be
+    identical regardless of process topology."""
+    from solver import montecarlo as _mc
+    from solver.resolver import build_opaque_state, parse_midgame
+    from solver.montecarlo import estimate
+
+    order = ["A", "2", "3", "4", "5", "6", "7", "8", "9", "10", "J", "Q", "K"]
+
+    def exp(s, t):
+        return [f"{r}{s}" for r in order[:order.index(t) + 1]]
+
+    fo = {"S": exp("S", "10"), "H": exp("H", "K"), "D": exp("D", "K"),
+          "C": exp("C", "J")}
+    cols = [["?", "JS"], ["?", "QS"], ["KC"], [], [], [], []]  # hidden {KS, QC}
+    st = build_opaque_state(parse_midgame(cols, [], foundations=fo, waste=[]))
+
+    # Force the sequential path by temporarily pretending there's one core.
+    orig = _mc.pool_size
+    _mc.pool_size = lambda: 1
+    try:
+        seq = estimate(st, samples=12, solve_budget=40_000)
+    finally:
+        _mc.pool_size = orig
+
+    par = estimate(st, samples=12, solve_budget=40_000)
+    assert seq["winProbability"] == par["winProbability"], (seq, par)
+    assert seq["best"] == par["best"], (seq["best"], par["best"])
+    assert seq["exact"] and par["exact"]
+    print("parallel matches sequential (exact position): OK")
+
+
+def check_parallel_wins_le_trials():
+    """After a time-limited PARALLEL run on a heavy position, every move must
+    satisfy wins <= trials (the invariant whose violation once produced a
+    complex sqrt in the Wilson interval)."""
+    from solver.montecarlo import estimate
+
+    gs = _heavy_hidden_state(seed=1)
+    hidden = sum(1 for col in gs.tableau for _c, up in col if not up)
+    assert hidden >= 15, f"expected a heavy position, got {hidden} hidden"
+    # samples high enough to engage the pool; tight time budget forces an early
+    # stop mid-run.
+    res = estimate(gs, samples=40, solve_budget=30_000, time_budget_s=1.5)
+    for pm in res["perMove"]:
+        assert pm["wins"] <= pm["trials"], pm
+        assert 0.0 <= pm["winRate"] <= 1.0, pm
+        assert isinstance(pm["winRate"], float)
+    assert res["winProbability"] <= 1.0
+    print(f"parallel wins<=trials under time cap: OK ({res['samples']} samples)")
+
+
+def check_racing_keeps_dominant_move():
+    """Racing elimination must never retire the eventual best move. On an exact
+    (exhaustive) position with a strictly dominant move, that move must be the
+    reported best and must NOT be marked eliminated."""
+    from solver.resolver import build_opaque_state, parse_midgame
+    from solver.montecarlo import estimate
+
+    order = ["A", "2", "3", "4", "5", "6", "7", "8", "9", "10", "J", "Q", "K"]
+
+    def exp(s, t):
+        return [f"{r}{s}" for r in order[:order.index(t) + 1]]
+
+    # Foundations: H, D, C complete; S up to 10 (need J, Q, K). Remaining pool
+    # for the two hidden slots is {KS, QC}. Sending JS to its foundation is the
+    # productive, winning first move; cycling the stock-less board is not.
+    fo = {"S": exp("S", "10"), "H": exp("H", "K"), "D": exp("D", "K"),
+          "C": exp("C", "J")}
+    cols = [["?", "JS"], ["?", "QS"], ["KC"], [], [], [], []]
+    st = build_opaque_state(parse_midgame(cols, [], foundations=fo, waste=[]))
+
+    res = estimate(st, samples=12, solve_budget=40_000)
+    best = res["perMove"][0]
+    assert not best.get("eliminated"), "the best move must not be eliminated"
+    assert best["winRate"] == max(m["winRate"] for m in res["perMove"]), res
+    # Exact position -> racing is suppressed, so nothing should be eliminated.
+    assert all(not m.get("eliminated") for m in res["perMove"]), res
+    print("racing keeps dominant move: OK")
+
+
+def _bench_worlds(seed: int = 2, count: int = 12):
+    """Deterministically rebuild the speed-plan benchmark worlds (seed 2, 12
+    determinized worlds) used by the solver-speed validation. Mirrors the
+    snippet in docs/plan-solver-speed.md so the verdicts here are the exact
+    ones the benchmark measures."""
+    import random
+
+    from solver.cards import UNKNOWN, full_deck
+    from solver.montecarlo import _determinize, _hidden_slots, _unknown_pool
+
+    rng = random.Random(seed)
+    deck = full_deck()
+    rng.shuffle(deck)
+    gs = GameState(draw_count=3)
+    idx = 0
+    for n in range(1, 8):
+        gs.tableau[n - 1] = [(deck[idx + i], i == n - 1) for i in range(n)]
+        idx += n
+    gs.stock = deck[idx:][::-1]
+    for col in gs.tableau:
+        for pi, (c, up) in enumerate(col):
+            if not up:
+                col[pi] = (UNKNOWN, False)
+    slots = _hidden_slots(gs)
+    pool = _unknown_pool(gs)
+    return [_determinize(gs, slots, pool, random.Random(i)) for i in range(count)]
+
+
+def check_solver_verdicts_stable():
+    """The win/lose verdict of each fixed benchmark world (seed 2) must match
+    the recorded baseline captured before the speed work. These are the exact
+    worlds the per-solve benchmark times, so this pins the solver's conclusion
+    for both winnable and budget-exhausting worlds."""
+    from solver.solver import solve
+
+    # Baseline outcomes recorded BEFORE the optimization (True = winnable).
+    expected = [True, True, True, True, False, False, True, True, True, True,
+                False, True]
+    worlds = _bench_worlds(seed=2, count=12)
+    got = [solve(w, max_states=60_000) is not None for w in worlds]
+    assert got == expected, f"verdict changed: {got} != {expected}"
+    print("solver verdicts stable (seed 2 worlds): OK")
+
+
+def check_is_winnable_matches_solve():
+    """The boolean `is_winnable` fast path must agree with
+    `solve(...) is not None` on every benchmark world (same search, no path
+    bookkeeping). A disagreement would mean the position-estimate path diverged
+    from the full solver."""
+    from solver.solver import is_winnable, solve
+
+    worlds = _bench_worlds(seed=2, count=12)
+    for i, w in enumerate(worlds):
+        a = solve(w, max_states=60_000) is not None
+        b = is_winnable(w, max_states=60_000)
+        assert a == b, f"world {i}: solve={a} but is_winnable={b}"
+    print("is_winnable matches solve: OK")
+
+
+def check_winning_lines_reach_won():
+    """Every winnable benchmark world's returned move list must actually reach a
+    won state when applied (guards the came-from reconstruction and the
+    copy-on-write apply_move)."""
+    from solver.engine import apply_move as _apply
+    from solver.solver import solve
+
+    worlds = _bench_worlds(seed=2, count=12)
+    checked = 0
+    for w in worlds:
+        sol = solve(w, max_states=60_000)
+        if sol is None:
+            continue
+        state = w
+        for m in sol:
+            state = _apply(state, m)
+        assert state.is_won(), "returned line must reach a won state"
+        checked += 1
+    assert checked >= 1
+    print(f"winning lines reach won state: OK ({checked} worlds)")
+
+
+def check_cheap_key_dedupes():
+    """The compact int-encoded key() must dedupe correctly: equal positions
+    produce equal keys, different positions produce different keys."""
+    import pickle
+
+    from solver.cards import UNKNOWN, Card
+
+    # Two independently-built identical positions -> equal keys.
+    def build():
+        g = GameState(draw_count=3)
+        g.tableau[0] = [(Card.parse("KS"), True), (Card.parse("QH"), True)]
+        g.tableau[1] = [(Card.parse("5C"), False), (Card.parse("4D"), True)]
+        g.foundations["S"] = [Card.parse("AS")]
+        g.stock = [Card.parse("2C"), Card.parse("3H")]
+        g.waste = [Card.parse("7D")]
+        return g
+
+    a, b = build(), build()
+    assert a.key() == b.key(), "equal positions must produce equal keys"
+
+    # A single differing attribute must change the key.
+    c = build()
+    c.tableau[0][-1] = (Card.parse("QD"), True)  # QH -> QD (different suit)
+    assert c.key() != a.key(), "different card identity must change the key"
+
+    d = build()
+    d.tableau[1][0] = (Card.parse("5C"), True)  # flip face-down -> face-up
+    assert d.key() != a.key(), "orientation must be part of the key"
+
+    # Face-up vs face-down UNKNOWN stay distinguishable (sentinel encoding).
+    e = GameState(draw_count=3); e.tableau[0] = [(UNKNOWN, True)]
+    f = GameState(draw_count=3); f.tableau[0] = [(UNKNOWN, False)]
+    assert e.key() != f.key(), "unknown orientation must be distinguishable"
+
+    # Pickle round-trip preserves the key after the representation change.
+    g = build()
+    assert pickle.loads(pickle.dumps(g)).key() == g.key(), \
+        "key must survive a pickle round-trip"
+    print("cheap key dedupes correctly: OK")
+
+
+def check_solve_deterministic():
+    """`solve` must be deterministic: the same start state yields the same move
+    list on repeated calls (no RNG, no cross-call shared cache)."""
+    from solver.solver import solve
+
+    worlds = _bench_worlds(seed=2, count=12)
+    for i, w in enumerate(worlds):
+        s1 = solve(w, max_states=60_000)
+        s2 = solve(w, max_states=60_000)
+        a = None if s1 is None else [
+            (m.kind, m.src, m.dst, m.count, m.card) for m in s1]
+        b = None if s2 is None else [
+            (m.kind, m.src, m.dst, m.count, m.card) for m in s2]
+        assert a == b, f"world {i}: solve not deterministic"
+    print("solve deterministic: OK")
+
+
 def check_game_over_only_when_no_moves():
     """Game over must require zero legal moves, not merely 'no proven win'."""
     from solver.engine import legal_moves
@@ -607,5 +878,18 @@ if __name__ == "__main__":
     check_unsafe_foundation_beats_dead_draw()
     check_exact_win_plan()
     check_mc_confidence_interval()
+    check_pickle_round_trip()
+    check_parallel_matches_sequential()
+    check_parallel_wins_le_trials()
+    check_racing_keeps_dominant_move()
     check_game_over_only_when_no_moves()
+    check_solver_verdicts_stable()
+    check_is_winnable_matches_solve()
+    check_winning_lines_reach_won()
+    check_cheap_key_dedupes()
+    check_solve_deterministic()
+
+    # Tear down the shared MC process pool so the interpreter exits cleanly.
+    from solver.parallel import shutdown_pool
+    shutdown_pool()
     print("\nAll sanity checks passed.")

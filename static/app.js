@@ -376,7 +376,7 @@ function setBusy(on, message) {
   document.body.classList.toggle("busy", active);
   // Disable in-flight-sensitive buttons while a request runs. "New game"
   // (resetBtn) stays enabled so the user can always bail out.
-  ["undoBtn", "refreshStepsBtn", "analyzeBtn"].forEach((id) => {
+  ["undoBtn", "refreshStepsBtn", "analyzeBtn", "deepAnalyzeBtn"].forEach((id) => {
     const el = document.getElementById(id);
     if (el) el.disabled = active;
   });
@@ -533,18 +533,19 @@ function updateUndoButton(canUndo) {
 
 // ---- Monte Carlo ----
 
-async function analyzeMonteCarlo() {
+async function analyzeMonteCarlo(deep = false) {
   if (!gameId) return;
   const mcInfo = document.getElementById("mcInfo");
-  mcInfo.textContent = "Running Monte Carlo analysis\u2026 (this can take a few seconds)";
+  mcInfo.textContent = deep
+    ? "Running DEEP Monte Carlo analysis\u2026 (more samples, this can take ~15-20s)"
+    : "Running Monte Carlo analysis\u2026 (this can take a few seconds)";
   mcInfo.className = "mc-info working";
-  const btn = document.getElementById("analyzeBtn");
-  btn.disabled = true;
+  setBusy(true, deep ? "Deep analyzing\u2026" : "Analyzing\u2026");
   try {
     const res = await fetch(`/api/analyze/${gameId}`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({}),
+      body: JSON.stringify({ deep }),
     });
     const data = await res.json();
     if (!res.ok) {
@@ -554,7 +555,7 @@ async function analyzeMonteCarlo() {
     }
     renderMcResult(data);
   } finally {
-    btn.disabled = false;
+    setBusy(false);
   }
 }
 
@@ -572,14 +573,15 @@ function renderMcResult(data) {
   const winProbability = data.winProbability;
   const margin = data.winMargin;
   const exact = data.exact;
-  const samples = data.samples;
+  const samples = (typeof data.samples === "number") ? data.samples : 0;
   const perMove = data.perMove;
   const timedOut = data.timedOut;
 
+  const deepTag = data.deep ? "deep, " : "";
   const head = exact
     ? `Win probability: ${fmtProb(winProbability, 0, true)} (exact \u2014 all layouts checked)`
     : `Estimated win probability: ${fmtProb(winProbability, margin, false)} ` +
-      `(${samples} sampled layouts${timedOut ? ", time-limited" : ""})`;
+      `(${deepTag}${samples} sampled layouts${timedOut ? ", time-limited" : ""})`;
   const lines = [head];
   if (perMove && perMove.length) {
     const top = perMove.slice(0, 4)
@@ -626,7 +628,8 @@ document.addEventListener("DOMContentLoaded", () => {
   document.getElementById("fillSampleBtn").onclick = fillSample;
   document.getElementById("refreshStepsBtn").onclick = loadSteps;
   document.getElementById("resetBtn").onclick = resetGame;
-  document.getElementById("analyzeBtn").onclick = analyzeMonteCarlo;
+  document.getElementById("analyzeBtn").onclick = () => analyzeMonteCarlo(false);
+  document.getElementById("deepAnalyzeBtn").onclick = () => analyzeMonteCarlo(true);
   document.getElementById("mcModeToggle").onchange = (e) => toggleMcMode(e.target.checked);
   document.getElementById("undoBtn").onclick = undoMove;
 });

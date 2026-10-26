@@ -20,7 +20,20 @@ import random
 from .cards import UNKNOWN, Card, full_deck, is_unknown
 from .engine import apply_move, legal_moves
 from .game import GameState, Move
-from .solver import solve
+from .parallel import (
+    eval_world_moves,
+    eval_world_winnable,
+    get_pool,
+    pool_size,
+)
+from .solver import is_winnable, solve
+
+# How many worlds to dispatch per parallel batch, as a multiple of the pool
+# size. One wave per batch keeps the wall-clock deadline responsive: once the
+# deadline passes we stop submitting, so the worst-case overrun is a single
+# in-flight wave rather than a big backlog. Racing elimination also re-evaluates
+# between batches, so smaller batches react faster.
+_BATCH_MULTIPLIER = 1
 
 
 def _hidden_slots(state: GameState) -> list[tuple[int, int]]:
@@ -110,9 +123,12 @@ def _choose_effort(num_hidden: int, requested_samples: int) -> dict:
 
     if arrangements is not None and arrangements <= 120:
         return {"mode": "exhaustive", "samples": arrangements, "arrangements": arrangements}
-    if num_hidden <= 14:
-        return {"mode": "sampled", "samples": max(40, min(requested_samples, 80))}
-    return {"mode": "sampled", "samples": min(requested_samples, 60)}
+    # Sampled modes: honor the requested target (the caller's tier: ~120
+    # default, ~800 deep). The wall-clock deadline is the real governor now —
+    # it stops sampling early if the target can't be reached — so we no longer
+    # hard-cap the count here (which silently throttled the deep tier). Keep a
+    # sensible floor so a tiny request still samples enough to rank moves.
+    return {"mode": "sampled", "samples": max(40, requested_samples)}
 
 
 def _world_stream(state: GameState, slots, pool, consistent, mode, rng):
@@ -129,6 +145,69 @@ def _world_stream(state: GameState, slots, pool, consistent, mode, rng):
             yield _determinize(state, slots, pool, rng)
 
 
+def _should_parallelize(num_hidden: int, mode: str, planned: int) -> bool:
+    """Whether the process pool is worth the IPC/startup overhead.
+
+    Tiny positions (few hidden cards, exhaustive enumeration, or a handful of
+    planned worlds) finish faster in-process than the cost of shipping worlds to
+    workers, so keep those sequential (this also protects the DEFAULT path's
+    responsiveness on light positions). Reuse the effort signal already chosen
+    by `_choose_effort`.
+    """
+    if pool_size() <= 1:
+        return False
+    if mode in ("exhaustive", "exact"):
+        return False
+    if num_hidden <= 7:
+        return False
+    # Only parallelize when there's enough work to spread across workers.
+    return planned >= 16
+
+
+def _submit_batch(pool, worlds, fn, extra):
+    """Submit one batch of worlds to `fn` and return the list of futures. The
+    world is always the first positional arg; `extra` is appended after it."""
+    return [pool.submit(fn, w, *extra) for w in worlds]
+
+
+def _drain_batch(futures, deadline, _time):
+    """Yield completed future results, honoring the wall-clock deadline.
+
+    Waits for futures as they finish; once the deadline passes it stops waiting,
+    cancels whatever is still pending, and ignores their results. Each future
+    corresponds to one world that is evaluated ATOMICALLY (all moves for that
+    world run inside the single worker call), so dropping an unfinished future
+    just drops that whole world — keeping `wins <= evaluated` and fair
+    comparison across the counted worlds.
+
+    Yields (result, timed_out_flag) per completed future; the flag is only ever
+    True on the sentinel final yield when the deadline cut collection short.
+    """
+    from concurrent.futures import FIRST_COMPLETED, wait
+
+    pending = set(futures)
+    while pending:
+        if deadline is None:
+            timeout = None
+        else:
+            timeout = deadline - _time.monotonic()
+            if timeout <= 0:
+                for f in pending:
+                    f.cancel()
+                yield (None, True)
+                return
+        done, pending = wait(pending, timeout=timeout,
+                              return_when=FIRST_COMPLETED)
+        if not done:
+            # Timed out waiting: cancel the rest and signal the cut.
+            for f in pending:
+                f.cancel()
+            yield (None, True)
+            return
+        for f in done:
+            yield (f.result(), False)
+
+
 def position_estimate(state: GameState, samples: int = 60,
                       solve_budget: int = 60_000,
                       rng: random.Random | None = None,
@@ -139,6 +218,10 @@ def position_estimate(state: GameState, samples: int = 60,
     position once per world and asks "is this world winnable at all?" — one
     solve per world instead of (moves x worlds). Use this for the
     win-probability readout; use `estimate` only when you need to compare moves.
+
+    Sampling across worlds is run on a shared process pool when the position is
+    heavy enough to benefit; it falls back cleanly to a single-process loop for
+    light positions or if the pool is unavailable.
     """
     import time as _time
 
@@ -168,21 +251,21 @@ def position_estimate(state: GameState, samples: int = 60,
     mode = effort["mode"] if (num_hidden and consistent) else "exact"
     planned = effort["samples"] if (num_hidden and consistent) else 1
 
-    winnable = 0
-    evaluated = 0
-    timed_out = False
-    for world in _world_stream(state, slots, pool, consistent, mode, rng):
-        if evaluated >= planned:
-            break
-        if deadline is not None and _time.monotonic() >= deadline:
-            timed_out = True
-            break
-        if solve(world, max_states=solve_budget) is not None:
-            winnable += 1
-        evaluated += 1
+    from .mclog import log as _log
+    _pt0 = _time.monotonic()
+    _par = _should_parallelize(num_hidden, mode, planned)
+    _log(f"position_estimate START hidden={num_hidden} mode={mode} "
+         f"planned={planned} parallel={_par} pool={pool_size()}")
+
+    winnable, evaluated, timed_out = _position_eval(
+        state, slots, pool, consistent, mode, planned, solve_budget, rng,
+        deadline, _time)
 
     exact = (mode in ("exhaustive", "exact")) and not timed_out
     p, margin, _ = _wilson_interval(winnable, evaluated)
+    _log(f"position_estimate DONE winnable={winnable}/{evaluated} "
+         f"winProb={(winnable/evaluated) if evaluated else 0.0:.2f} "
+         f"timedOut={timed_out} elapsed={_time.monotonic()-_pt0:.1f}s")
     return {
         "winProbability": (winnable / evaluated) if evaluated else 0.0,
         "winMargin": 0.0 if exact else margin,
@@ -193,6 +276,82 @@ def position_estimate(state: GameState, samples: int = 60,
         "gameOver": False,
         "timedOut": timed_out,
     }
+
+
+def _position_eval(state, slots, pool_cards, consistent, mode, planned,
+                   solve_budget, rng, deadline, _time):
+    """Evaluate `planned` worlds for 'winnable at all?', parallel or sequential.
+
+    Returns (winnable, evaluated, timed_out). Only fully-completed worlds are
+    counted so `winnable <= evaluated` always holds.
+    """
+    executor = get_pool() if _should_parallelize(
+        len(slots) if consistent else 0, mode, planned) else None
+
+    if executor is None:
+        return _position_eval_seq(state, slots, pool_cards, consistent, mode,
+                                  planned, solve_budget, rng, deadline, _time)
+    try:
+        return _position_eval_par(executor, state, slots, pool_cards, consistent,
+                                  mode, planned, solve_budget, rng, deadline,
+                                  _time)
+    except Exception:
+        # A worker/pool failure must never break the request: fall back to the
+        # in-process path for a clean (if slower) answer.
+        return _position_eval_seq(state, slots, pool_cards, consistent, mode,
+                                  planned, solve_budget, rng, deadline, _time)
+
+
+def _position_eval_seq(state, slots, pool_cards, consistent, mode, planned,
+                       solve_budget, rng, deadline, _time):
+    winnable = 0
+    evaluated = 0
+    timed_out = False
+    for world in _world_stream(state, slots, pool_cards, consistent, mode, rng):
+        if evaluated >= planned:
+            break
+        if deadline is not None and _time.monotonic() >= deadline:
+            timed_out = True
+            break
+        if is_winnable(world, max_states=solve_budget):
+            winnable += 1
+        evaluated += 1
+    return winnable, evaluated, timed_out
+
+
+def _position_eval_par(executor, state, slots, pool_cards, consistent, mode,
+                       planned, solve_budget, rng, deadline, _time):
+    winnable = 0
+    evaluated = 0
+    timed_out = False
+    batch = max(pool_size() * _BATCH_MULTIPLIER, 1)
+    stream = _world_stream(state, slots, pool_cards, consistent, mode, rng)
+
+    while evaluated < planned:
+        if deadline is not None and _time.monotonic() >= deadline:
+            timed_out = True
+            break
+        want = min(batch, planned - evaluated)
+        worlds = []
+        for _ in range(want):
+            try:
+                worlds.append(next(stream))
+            except StopIteration:
+                break
+        if not worlds:
+            break
+        futures = _submit_batch(executor, worlds, eval_world_winnable,
+                                (solve_budget,))
+        for result, cut in _drain_batch(futures, deadline, _time):
+            if cut:
+                timed_out = True
+                break
+            if result:
+                winnable += 1
+            evaluated += 1
+        if timed_out:
+            break
+    return winnable, evaluated, timed_out
 
 
 def exact_win_plan(state: GameState, n: int = 3, solve_budget: int = 200_000):
@@ -353,8 +512,6 @@ def estimate(state: GameState, samples: int = 60, solve_budget: int = 60_000,
             "gameOver": False,
         }
 
-    import itertools as _it
-
     slots = _hidden_slots(state)
     pool = _unknown_pool(state)
     consistent = (len(pool) == len(slots))
@@ -365,24 +522,157 @@ def estimate(state: GameState, samples: int = 60, solve_budget: int = 60_000,
     effort = _choose_effort(num_hidden, samples)
     mode = effort["mode"]
     planned = effort["samples"]
-
-    # Build the stream of worlds to evaluate.
     if num_hidden == 0 or not consistent:
-        worlds_iter = iter([state.clone()])
         planned = 1
         mode = "exact"  # fully known position: a single deterministic world
+
+    from .mclog import log as _log
+    _t0 = _time.monotonic()
+    parallel = _should_parallelize(num_hidden, mode, planned)
+    _log(f"estimate START moves={len(moves)} hidden={num_hidden} mode={mode} "
+         f"planned={planned} parallel={parallel} pool={pool_size()} "
+         f"solve_budget={solve_budget} time_budget={time_budget_s}")
+
+    agg = _estimate_core(state, moves, slots, pool, consistent, mode, planned,
+                         solve_budget, rng, deadline, _time)
+    wins = agg["wins"]
+    evaluated = agg["evaluated"]
+    world_any_win_count = agg["world_any_win_count"]
+    timed_out = agg["timed_out"]
+    eliminated = agg["eliminated"]
+
+    # Exhaustive + no timeout = exact (no sampling error).
+    exact = (mode in ("exhaustive", "exact")) and not timed_out
+
+    per_move = []
+    for mi, mv in enumerate(moves):
+        p, margin, _ = _wilson_interval(wins[mi], evaluated)
+        per_move.append({
+            "move": {"kind": mv.kind, "src": mv.src, "dst": mv.dst,
+                     "count": mv.count, "card": mv.card},
+            "description": mv.describe(),
+            "wins": wins[mi],
+            "trials": evaluated,
+            "winRate": (wins[mi] / evaluated) if evaluated else 0.0,
+            "margin": 0.0 if exact else margin,
+            "eliminated": mi in eliminated,
+        })
+
+    # Surviving (non-eliminated) moves rank first, then by win rate. An
+    # eliminated move is proven to trail the leader, so it can never be `best`.
+    per_move.sort(key=lambda m: (not m["eliminated"], m["winRate"]), reverse=True)
+    win_probability = (world_any_win_count / evaluated) if evaluated else 0.0
+    _, wp_margin, _ = _wilson_interval(world_any_win_count, evaluated)
+    best = per_move[0]["move"] if per_move else None
+
+    _best = per_move[0] if per_move else None
+    _log(f"estimate DONE evaluated={evaluated}/{planned} "
+         f"winProb={win_probability:.2f}+/-{(0.0 if exact else wp_margin):.2f} "
+         f"timedOut={timed_out} eliminated={len(eliminated)}/{len(moves)} "
+         f"best={(_best['description'] + ' @%.2f' % _best['winRate']) if _best else None} "
+         f"elapsed={_time.monotonic() - _t0:.1f}s")
+
+    return {
+        "winProbability": win_probability,
+        "winMargin": 0.0 if exact else wp_margin,
+        "exact": exact,
+        "mode": mode,
+        "samples": evaluated,
+        "consistent": consistent,
+        "timedOut": timed_out,
+        "perMove": per_move,
+        "best": best,
+        "won": False,
+        "gameOver": False,
+    }
+
+
+def _estimate_core(state, moves, slots, pool_cards, consistent, mode, planned,
+                   solve_budget, rng, deadline, _time):
+    """Evaluate `planned` worlds across all `moves`, returning aggregate win
+    counts. Dispatches to the parallel path when worthwhile, else sequential.
+    Guarantees ``wins[mi] <= evaluated`` for every move (fair comparison), and
+    applies racing elimination to stop sampling moves that cannot catch up.
+    """
+    executor = get_pool() if _should_parallelize(
+        len(slots) if consistent else 0, mode, planned) else None
+
+    if executor is None:
+        return _estimate_core_seq(state, moves, slots, pool_cards, consistent,
+                                  mode, planned, solve_budget, rng, deadline,
+                                  _time)
+    try:
+        return _estimate_core_par(executor, state, moves, slots, pool_cards,
+                                  consistent, mode, planned, solve_budget, rng,
+                                  deadline, _time)
+    except Exception as exc:
+        # Degrade to the in-process path on any pool/worker failure so the
+        # request still returns a clean answer.
+        from .mclog import log as _log
+        _log(f"estimate PARALLEL FAILED, falling back to sequential: "
+             f"{type(exc).__name__}: {exc}")
+        return _estimate_core_seq(state, moves, slots, pool_cards, consistent,
+                                  mode, planned, solve_budget, rng, deadline,
+                                  _time)
+
+
+def _racing_eliminated(wins, evaluated, contenders, enabled=True):
+    """Return the set of contender indices that can be eliminated: a move whose
+    Wilson UPPER bound is below the current leader's Wilson LOWER bound can't
+    catch up. Needs enough evidence (a few evaluated worlds) to be meaningful.
+    Never eliminates the current leader, and never drops to zero contenders.
+
+    `enabled` is False for exhaustive/exact runs: there, every arrangement must
+    be evaluated for the result to stay exact, so racing is suppressed.
+    """
+    if not enabled or evaluated < 8 or len(contenders) <= 1:
+        return set()
+
+    bounds = {}
+    for mi in contenders:
+        p, _, half = _wilson_interval(wins[mi], evaluated)
+        # Reconstruct the clamped centre so lo/hi match _wilson_interval.
+        z2 = 1.96 * 1.96
+        denom = 1 + z2 / evaluated
+        pc = min(1.0, max(0.0, wins[mi] / evaluated))
+        centre = (pc + z2 / (2 * evaluated)) / denom
+        lo = max(0.0, centre - half)
+        hi = min(1.0, centre + half)
+        bounds[mi] = (lo, hi)
+
+    leader = max(contenders, key=lambda mi: wins[mi])
+    leader_lo = bounds[leader][0]
+    drop = set()
+    for mi in contenders:
+        if mi == leader:
+            continue
+        if bounds[mi][1] < leader_lo:
+            drop.add(mi)
+    # Keep at least the leader as a contender.
+    if len(drop) >= len(contenders):
+        drop.discard(leader)
+    return drop
+
+
+def _estimate_core_seq(state, moves, slots, pool_cards, consistent, mode,
+                       planned, solve_budget, rng, deadline, _time):
+    import itertools as _it
+
+    if mode == "exact" or not (slots and consistent):
+        worlds_iter = iter([state.clone()])
     elif mode == "exhaustive":
         worlds_iter = (_build_world(state, slots, perm)
-                       for perm in _it.permutations(pool))
+                       for perm in _it.permutations(pool_cards))
     else:
-        worlds_iter = (_determinize(state, slots, pool, rng) for _ in range(planned))
+        worlds_iter = (_determinize(state, slots, pool_cards, rng)
+                       for _ in range(planned))
 
-    # Evaluate world-by-world so the wall-clock cap can stop early with every
-    # move having been tried on the SAME number of worlds (fair comparison).
     wins = [0] * len(moves)
     world_any_win_count = 0
     evaluated = 0
     timed_out = False
+    contenders = set(range(len(moves)))
+    eliminated: set[int] = set()
 
     for world in worlds_iter:
         if evaluated >= planned:
@@ -393,7 +683,8 @@ def estimate(state: GameState, samples: int = 60, solve_budget: int = 60_000,
         any_win = False
         aborted = False
         world_wins = []  # indices incremented for THIS world, so we can roll back
-        for mi, mv in enumerate(moves):
+        for mi in sorted(contenders):
+            mv = moves[mi]
             if deadline is not None and _time.monotonic() >= deadline:
                 timed_out = True
                 aborted = True
@@ -413,40 +704,83 @@ def estimate(state: GameState, samples: int = 60, solve_budget: int = 60_000,
             world_any_win_count += 1
         evaluated += 1
 
-    # Exhaustive + no timeout = exact (no sampling error).
-    exact = (mode in ("exhaustive", "exact")) and not timed_out
+        # Racing: retire contenders that provably trail the leader. Suppressed
+        # in exhaustive/exact mode so the enumeration stays complete (exact).
+        drop = _racing_eliminated(wins, evaluated, contenders,
+                                  enabled=(mode == "sampled"))
+        if drop:
+            eliminated |= drop
+            contenders -= drop
+        if len(contenders) <= 1 and mode == "sampled":
+            break
 
-    per_move = []
-    for mi, mv in enumerate(moves):
-        p, margin, _ = _wilson_interval(wins[mi], evaluated)
-        per_move.append({
-            "move": {"kind": mv.kind, "src": mv.src, "dst": mv.dst,
-                     "count": mv.count, "card": mv.card},
-            "description": mv.describe(),
-            "wins": wins[mi],
-            "trials": evaluated,
-            "winRate": (wins[mi] / evaluated) if evaluated else 0.0,
-            "margin": 0.0 if exact else margin,
-        })
+    return {"wins": wins, "evaluated": evaluated,
+            "world_any_win_count": world_any_win_count,
+            "timed_out": timed_out, "eliminated": eliminated}
 
-    per_move.sort(key=lambda m: m["winRate"], reverse=True)
-    win_probability = (world_any_win_count / evaluated) if evaluated else 0.0
-    _, wp_margin, _ = _wilson_interval(world_any_win_count, evaluated)
-    best = per_move[0]["move"] if per_move else None
 
-    return {
-        "winProbability": win_probability,
-        "winMargin": 0.0 if exact else wp_margin,
-        "exact": exact,
-        "mode": mode,
-        "samples": evaluated,
-        "consistent": consistent,
-        "timedOut": timed_out,
-        "perMove": per_move,
-        "best": best,
-        "won": False,
-        "gameOver": False,
-    }
+def _estimate_core_par(executor, state, moves, slots, pool_cards, consistent,
+                       mode, planned, solve_budget, rng, deadline, _time):
+    wins = [0] * len(moves)
+    world_any_win_count = 0
+    evaluated = 0
+    timed_out = False
+    contenders = set(range(len(moves)))
+    eliminated: set[int] = set()
+
+    batch = max(pool_size() * _BATCH_MULTIPLIER, 1)
+    stream = _world_stream(state, slots, pool_cards, consistent, mode, rng)
+
+    while evaluated < planned and len(contenders) > 1:
+        if deadline is not None and _time.monotonic() >= deadline:
+            timed_out = True
+            break
+        want = min(batch, planned - evaluated)
+        worlds = []
+        for _ in range(want):
+            try:
+                worlds.append(next(stream))
+            except StopIteration:
+                break
+        if not worlds:
+            break
+
+        # Only test the current contenders in the workers — that's where racing
+        # saves real work. Every contender is tested on the SAME batch of
+        # worlds, preserving fair comparison among them.
+        move_tuple = tuple(moves[mi] for mi in sorted(contenders))
+        idx_order = sorted(contenders)
+        futures = _submit_batch(executor, worlds, eval_world_moves,
+                                (move_tuple, solve_budget))
+
+        # Each future is one world evaluated ATOMICALLY across all contenders,
+        # so a completed future advances every contender together (fair), and
+        # dropping an unfinished one at the deadline drops that whole world —
+        # keeping wins <= evaluated.
+        for res, cut in _drain_batch(futures, deadline, _time):
+            if cut:
+                timed_out = True
+                break
+            any_win = False
+            for slot, mi in enumerate(idx_order):
+                if res[slot]:
+                    wins[mi] += 1
+                    any_win = True
+            if any_win:
+                world_any_win_count += 1
+            evaluated += 1
+        if timed_out:
+            break
+
+        drop = _racing_eliminated(wins, evaluated, contenders,
+                                  enabled=(mode == "sampled"))
+        if drop:
+            eliminated |= drop
+            contenders -= drop
+
+    return {"wins": wins, "evaluated": evaluated,
+            "world_any_win_count": world_any_win_count,
+            "timed_out": timed_out, "eliminated": eliminated}
 
 
 def mc_plan_steps(state: GameState, n: int = 3, samples: int = 60,
@@ -527,6 +861,7 @@ def mc_plan_steps(state: GameState, n: int = 3, samples: int = 60,
         "winMargin": est.get("winMargin", 0.0),
         "exact": est.get("exact", False),
         "timedOut": est.get("timedOut", False),
+        "samples": est.get("samples", 0),
         "perMove": est["perMove"],
         "mc": True,
     }

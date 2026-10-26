@@ -14,6 +14,13 @@ from dataclasses import dataclass, field, replace
 
 from .cards import Card, can_stack_foundation, can_stack_tableau
 
+# Reserved key-id sentinels for a face-up / face-down UNKNOWN card. Chosen
+# outside the real kid range (4..55) and distinct from each other so an unknown
+# never collides with a real card and the two orientations stay distinguishable
+# (matching the old (None, None, up) tuple encoding).
+_UNKNOWN_UP_KID = 0
+_UNKNOWN_DOWN_KID = 100
+
 
 @dataclass(frozen=True)
 class Move:
@@ -188,11 +195,31 @@ class GameState:
     # ---- canonical key for search dedupe ----
 
     def key(self) -> tuple:
-        tab = tuple(
-            tuple((c.rank, c.suit, up) for c, up in col)
+        """Canonical, hashable identity of this state for search dedupe.
+
+        Each card is encoded by its precomputed compact id (`Card.kid`, a small
+        int unique per card), with 0 as the sentinel for a face-up UNKNOWN. A
+        face-up card is tagged by making its entry positive; a face-down card
+        negates it, so (identity, face_up) collapses into a single int and we
+        avoid building per-card (rank, suit, up) tuples in the hot path.
+
+        Determinism: the encoding is a pure function of card identity and
+        orientation, independent of object identity or dict ordering, so equal
+        positions always produce equal keys and different positions differ.
+        """
+        # Encode each column inline (no per-column helper call) as a tuple of
+        # small ints: +kid face-up, -kid face-down, reserved sentinels for an
+        # UNKNOWN. This runs in the interpreter's fast comprehension path.
+        tab = tuple([
+            tuple([
+                (c.kid if up else -c.kid) if c.kid is not None
+                else (_UNKNOWN_UP_KID if up else _UNKNOWN_DOWN_KID)
+                for c, up in col
+            ])
             for col in self.tableau
-        )
-        found = tuple((s, len(self.foundations[s])) for s in ("S", "H", "D", "C"))
-        stock = tuple((c.rank, c.suit) for c in self.stock)
-        waste = tuple((c.rank, c.suit) for c in self.waste)
+        ])
+        f = self.foundations
+        found = (len(f["S"]), len(f["H"]), len(f["D"]), len(f["C"]))
+        stock = tuple([c.kid for c in self.stock])
+        waste = tuple([c.kid for c in self.waste])
         return (tab, found, stock, waste)

@@ -27,8 +27,11 @@ STR_TO_RANK = {
 SUIT_SYMBOLS = {"S": "\u2660", "H": "\u2665", "D": "\u2666", "C": "\u2663"}
 
 
+SUIT_INDEX = {"S": 0, "H": 1, "D": 2, "C": 3}
+
+
 class Card:
-    __slots__ = ("rank", "suit")
+    __slots__ = ("rank", "suit", "kid", "red", "_code")
 
     def __init__(self, rank: int, suit: str):
         if not 1 <= rank <= 13:
@@ -37,10 +40,22 @@ class Card:
             raise ValueError(f"invalid suit: {suit}")
         self.rank = rank
         self.suit = suit
+        # Compact identity integer for cheap search keys: 0..51, one per card.
+        # rank is 1..13, suit index is 0..3 -> kid in 1..55 (never 0; 0 is the
+        # UNKNOWN sentinel in key encodings). Precomputed once at construction
+        # so the hot path never rebuilds (rank, suit) tuples.
+        self.kid = rank * 4 + SUIT_INDEX[suit]
+        # Precomputed color as a plain attribute so the hot tableau-stacking
+        # check reads a slot instead of calling the is_red property per compare.
+        self.red = suit in RED_SUITS
+        # Precomputed canonical code string; move generation stamps a card code
+        # onto every candidate Move, so building the f-string once per card
+        # (not once per move) removes it from the hot path.
+        self._code = f"{RANK_TO_STR[rank]}{suit}"
 
     @property
     def is_red(self) -> bool:
-        return self.suit in RED_SUITS
+        return self.red
 
     @property
     def is_black(self) -> bool:
@@ -61,7 +76,7 @@ class Card:
 
     def code(self) -> str:
         """Canonical code, e.g. 'AS', '10H', 'KC'."""
-        return f"{RANK_TO_STR[self.rank]}{self.suit}"
+        return self._code
 
     def pretty(self) -> str:
         return f"{RANK_TO_STR[self.rank]}{SUIT_SYMBOLS[self.suit]}"
@@ -95,6 +110,8 @@ class _Unknown:
     __slots__ = ()
     rank = None
     suit = None
+    kid = None  # key-id sentinel: None marks an unknown identity in key()
+    red = False  # class-level color stub so .red never AttributeErrors
 
     @property
     def is_red(self) -> bool:  # pragma: no cover - should never be queried
@@ -124,12 +141,20 @@ UNKNOWN = _Unknown()
 
 
 def is_unknown(card) -> bool:
-    return isinstance(card, _Unknown)
+    # UNKNOWN is a module-level singleton (the only _Unknown ever created), so
+    # an identity check is both correct and far cheaper than isinstance in the
+    # hot path. Fall back to isinstance only for the (never-hit) case of a
+    # separately-unpickled sentinel, keeping the guard robust.
+    return card is UNKNOWN or isinstance(card, _Unknown)
 
 
 def can_stack_tableau(moving: Card, onto: Card) -> bool:
-    """Alternating color, descending by one. e.g. red 6 onto black 7."""
-    return moving.rank + 1 == onto.rank and moving.is_red != onto.is_red
+    """Alternating color, descending by one. e.g. red 6 onto black 7.
+
+    Reads the precomputed `red` slot (not the is_red property) because this is
+    called millions of times per heavy solve.
+    """
+    return moving.rank + 1 == onto.rank and moving.red != onto.red
 
 
 def can_stack_foundation(moving: Card, top: Card | None, foundation_suit: str | None) -> bool:

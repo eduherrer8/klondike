@@ -2,132 +2,203 @@
 
 from __future__ import annotations
 
-from .cards import Card, can_stack_foundation, can_stack_tableau, is_unknown
+from .cards import UNKNOWN, Card, can_stack_foundation, can_stack_tableau, is_unknown
 from .game import GameState, Move
 
 
-def _flip_if_needed(col: list[tuple[Card, bool]]) -> None:
-    """After removing cards, ensure the new top card is face-up."""
+def _flip_top(col: list[tuple[Card, bool]]) -> None:
+    """Flip the new top card face-up in place (col is a fresh, owned list)."""
     if col and not col[-1][1]:
         card, _ = col[-1]
         col[-1] = (card, True)
 
 
 def apply_move(state: GameState, move: Move) -> GameState:
-    """Return a new state with the move applied. Does not validate heavily;
-    legal_moves is the source of truth for legality."""
-    s = state.clone()
+    """Return a NEW state with the move applied, using copy-on-write.
 
-    if move.kind == "draw":
-        if not s.stock:
+    Rather than deep-cloning the whole position for every candidate move (the
+    old hot-path cost), this shares the parent's unchanged structures by
+    reference and copies only the tableau columns / foundation pile the move
+    actually touches. Correctness rests on an invariant the solver upholds:
+    GameStates are treated as immutable after construction, so sharing a list
+    object between parent and child is safe as long as we never mutate a shared
+    list — every branch below copies a structure before changing it.
+
+    `legal_moves` is the source of truth for legality; this does not re-validate.
+    """
+    kind = move.kind
+    tab = state.tableau  # shared unless a column changes
+
+    if kind == "draw":
+        if not state.stock:
             # recycle waste back into stock (preserving order)
-            s.stock = s.waste[::-1]
-            s.waste = []
-            s.fan_size = 0
-        else:
-            n = min(s.draw_count, len(s.stock))
-            drawn = [s.stock.pop() for _ in range(n)]  # pop from end
-            s.waste.extend(drawn)
-            s.fan_size = n  # the current visible fan is these n cards
-        return s
+            return GameState(
+                tableau=tab, foundations=state.foundations,
+                stock=state.waste[::-1], waste=[], draw_count=state.draw_count,
+                fan_size=0,
+            )
+        n = min(state.draw_count, len(state.stock))
+        new_stock = state.stock[:-n]
+        drawn = state.stock[-1:-n - 1:-1]  # last n, in pop order (end first)
+        return GameState(
+            tableau=tab, foundations=state.foundations,
+            stock=new_stock, waste=state.waste + drawn,
+            draw_count=state.draw_count, fan_size=n,
+        )
 
-    if move.kind == "tableau":
-        src_col = s.tableau[move.src]
+    if kind == "tableau":
+        new_tab = list(tab)
+        src_col = tab[move.src]
         moving = src_col[-move.count:]
-        s.tableau[move.src] = src_col[:-move.count]
-        _flip_if_needed(s.tableau[move.src])
-        s.tableau[move.dst].extend(moving)
-        return s
+        shortened = src_col[:-move.count]
+        _flip_top(shortened)
+        new_tab[move.src] = shortened
+        new_tab[move.dst] = tab[move.dst] + moving
+        return GameState(
+            tableau=new_tab, foundations=state.foundations,
+            stock=state.stock, waste=state.waste,
+            draw_count=state.draw_count, fan_size=state.fan_size,
+        )
 
-    if move.kind == "to_foundation":
-        src_col = s.tableau[move.src]
+    if kind == "to_foundation":
+        new_tab = list(tab)
+        src_col = list(tab[move.src])
         card, _ = src_col.pop()
-        s.tableau[move.src] = src_col
-        _flip_if_needed(s.tableau[move.src])
-        s.foundations[card.suit].append(card)
-        return s
+        _flip_top(src_col)
+        new_tab[move.src] = src_col
+        new_found = dict(state.foundations)
+        new_found[card.suit] = state.foundations[card.suit] + [card]
+        return GameState(
+            tableau=new_tab, foundations=new_found,
+            stock=state.stock, waste=state.waste,
+            draw_count=state.draw_count, fan_size=state.fan_size,
+        )
 
-    if move.kind == "waste_to_tableau":
-        card = s.waste.pop()
-        s.tableau[move.dst].append((card, True))
-        s.fan_size = max(0, s.fan_size - 1)  # peeled one off the current fan
-        return s
+    if kind == "waste_to_tableau":
+        card = state.waste[-1]
+        new_tab = list(tab)
+        new_tab[move.dst] = tab[move.dst] + [(card, True)]
+        return GameState(
+            tableau=new_tab, foundations=state.foundations,
+            stock=state.stock, waste=state.waste[:-1],
+            draw_count=state.draw_count, fan_size=max(0, state.fan_size - 1),
+        )
 
-    if move.kind == "waste_to_foundation":
-        card = s.waste.pop()
-        s.foundations[card.suit].append(card)
-        s.fan_size = max(0, s.fan_size - 1)
-        return s
+    if kind == "waste_to_foundation":
+        card = state.waste[-1]
+        new_found = dict(state.foundations)
+        new_found[card.suit] = state.foundations[card.suit] + [card]
+        return GameState(
+            tableau=tab, foundations=new_found,
+            stock=state.stock, waste=state.waste[:-1],
+            draw_count=state.draw_count, fan_size=max(0, state.fan_size - 1),
+        )
 
-    if move.kind == "foundation_to_tableau":
-        # src holds the suit index here via card code
+    if kind == "foundation_to_tableau":
         card = Card.parse(move.card)
-        s.foundations[card.suit].pop()
-        s.tableau[move.dst].append((card, True))
-        return s
+        new_found = dict(state.foundations)
+        new_found[card.suit] = state.foundations[card.suit][:-1]
+        new_tab = list(tab)
+        new_tab[move.dst] = tab[move.dst] + [(card, True)]
+        return GameState(
+            tableau=new_tab, foundations=new_found,
+            stock=state.stock, waste=state.waste,
+            draw_count=state.draw_count, fan_size=state.fan_size,
+        )
 
     raise ValueError(f"unknown move kind: {move.kind}")
 
 
 def legal_moves(state: GameState) -> list[Move]:
     moves: list[Move] = []
+    tableau = state.tableau
+    foundations = state.foundations
+
+    # Each destination column's exposed (top_card, playable?) computed once, so
+    # the run-placement and waste-placement loops below don't re-inspect tops.
+    # playable means: a face-up KNOWN card you may stack onto.
+    dst_tops: list[tuple[Card | None, bool]] = []
+    for col in tableau:
+        if not col:
+            dst_tops.append((None, False))
+            continue
+        tc, tup = col[-1]
+        dst_tops.append((tc, tup and tc is not UNKNOWN and tc.kid is not None))
 
     # 1. Tableau card(s) -> foundation (only the single top card)
-    for col_i, col in enumerate(state.tableau):
+    for col_i, col in enumerate(tableau):
         if not col:
             continue
         card, up = col[-1]
-        if up and not is_unknown(card) and \
+        if up and card is not UNKNOWN and card.kid is not None and \
                 can_stack_foundation(card, state.foundation_top(card.suit), card.suit):
             moves.append(Move("to_foundation", src=col_i, card=card.code()))
 
     # 2. Waste top -> foundation
-    if state.waste:
-        w = state.waste[-1]
-        if not is_unknown(w) and \
-                can_stack_foundation(w, state.foundation_top(w.suit), w.suit):
-            moves.append(Move("waste_to_foundation", card=w.code()))
+    waste = state.waste
+    w = waste[-1] if waste else None
+    w_known = w is not None and w is not UNKNOWN and w.kid is not None
+    if w_known and can_stack_foundation(w, state.foundation_top(w.suit), w.suit):
+        moves.append(Move("waste_to_foundation", card=w.code()))
 
     # 3. Tableau run -> another tableau.
     # This variant does NOT allow splitting a column's face-up run: a
-    # tableau-to-tableau move always moves the ENTIRE face-up run of the
-    # source column. The bottom of that run is run[0].
-    for src_i, col in enumerate(state.tableau):
-        run = state.column_face_up_run(src_i)
-        if not run:
+    # tableau-to-tableau move always moves the ENTIRE face-up run of the source
+    # column. The movable run is the maximal block of contiguous face-up KNOWN
+    # cards at the top; an UNKNOWN or any face-down card below ends it. We scan
+    # each column from the top down once, tracking only the run's bottom card
+    # and length (no list is materialized) — this was the hottest spot.
+    for src_i in range(7):
+        col = tableau[src_i]
+        n = len(col)
+        if not n:
             continue
-        bottom = run[0]
-        count = len(run)
-        has_facedown_below = count < len(col)  # face-down cards remain beneath the run
-        for dst_i, dst_col in enumerate(state.tableau):
+        count = 0
+        bottom = None
+        # Walk from the top toward the bottom collecting face-up known cards;
+        # stop at the first face-down or opaque-unknown card. The collected
+        # block is exactly column_face_up_run's trailing run.
+        for j in range(n - 1, -1, -1):
+            card, up = col[j]
+            if not up or card is UNKNOWN or card.kid is None:
+                break
+            bottom = card
+            count += 1
+        if count == 0:
+            # Top is face-down or an opaque unknown: nothing movable here.
+            continue
+        has_facedown_below = count < n
+        bottom_is_king = bottom.rank == 13
+        bottom_code = bottom.code()
+        for dst_i in range(7):
             if dst_i == src_i:
                 continue
-            if not dst_col:
-                # Only a King may move to an empty column. Moving a King-led
-                # run from a column that has nothing beneath it (the run is the
-                # whole column) just relocates it to another empty column, a
-                # pointless loop, so skip that case.
-                if bottom.rank == 13 and has_facedown_below:
-                    moves.append(Move("tableau", src=src_i, dst=dst_i, count=count, card=bottom.code()))
-            else:
-                top_card, top_up = dst_col[-1]
-                if top_up and not is_unknown(top_card) and can_stack_tableau(bottom, top_card):
-                    moves.append(Move("tableau", src=src_i, dst=dst_i, count=count, card=bottom.code()))
+            top_card, playable = dst_tops[dst_i]
+            if top_card is None:
+                # Only a King may move to an empty column. Moving a King-led run
+                # from a column with nothing beneath it just relocates it, a
+                # pointless loop, so require face-down cards remain beneath.
+                if bottom_is_king and has_facedown_below:
+                    moves.append(Move("tableau", src=src_i, dst=dst_i,
+                                      count=count, card=bottom_code))
+            elif playable and can_stack_tableau(bottom, top_card):
+                moves.append(Move("tableau", src=src_i, dst=dst_i,
+                                  count=count, card=bottom_code))
 
     # 4. Waste top -> tableau
-    if state.waste:
-        w = state.waste[-1]
-        for dst_i, dst_col in enumerate(state.tableau):
-            if not dst_col:
-                if w.rank == 13:
-                    moves.append(Move("waste_to_tableau", dst=dst_i, card=w.code()))
-            else:
-                top_card, top_up = dst_col[-1]
-                if top_up and not is_unknown(top_card) and can_stack_tableau(w, top_card):
-                    moves.append(Move("waste_to_tableau", dst=dst_i, card=w.code()))
+    if w_known:
+        w_is_king = w.rank == 13
+        w_code = w.code()
+        for dst_i in range(7):
+            top_card, playable = dst_tops[dst_i]
+            if top_card is None:
+                if w_is_king:
+                    moves.append(Move("waste_to_tableau", dst=dst_i, card=w_code))
+            elif playable and can_stack_tableau(w, top_card):
+                moves.append(Move("waste_to_tableau", dst=dst_i, card=w_code))
 
     # 5. Draw (or recycle) from stock
-    if state.stock or state.waste:
+    if state.stock or waste:
         moves.append(Move("draw"))
 
     return moves

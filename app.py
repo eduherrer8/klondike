@@ -25,15 +25,25 @@ from solver.montecarlo import (
     mc_plan_steps,
     position_estimate as mc_position_estimate,
 )
+from solver.parallel import shutdown_pool
+from solver.mclog import log as mclog
 from solver import storage
 
-# Monte Carlo defaults (tunable per request). Kept modest so "MC drives
-# recommendations" mode stays usable on positions with many hidden cards. A
-# wall-clock cap (time_budget_s inside estimate) guarantees MC returns a
-# best-effort answer quickly instead of freezing the UI.
-MC_SAMPLES = 60
-MC_SOLVE_BUDGET = 30_000
-MC_TIME_BUDGET_S = 8.0
+# Monte Carlo DEFAULT tier (drives recommendations; must feel responsive).
+# World evaluation runs on a reused process pool (see solver/parallel.py), so
+# the per-world cost is spread across cores and we can afford more samples than
+# the old sequential path in the same wall-clock. A time cap still guarantees a
+# best-effort answer instead of freezing the UI.
+MC_SAMPLES = 120
+MC_SOLVE_BUDGET = 60_000
+MC_TIME_BUDGET_S = 5.0
+
+# Monte Carlo DEEP tier (explicit, on-demand "Deep analyze"). Many more samples
+# and a much higher per-world solve budget for a stronger, more stable verdict,
+# with a correspondingly longer wall-clock cap.
+MC_DEEP_SAMPLES = 800
+MC_DEEP_SOLVE_BUDGET = 200_000
+MC_DEEP_TIME_BUDGET_S = 20.0
 
 app = Flask(__name__, static_folder="static", static_url_path="")
 # Dev tool, single user: never cache static assets, so edits to app.js/styles.css
@@ -49,6 +59,18 @@ def _no_cache(resp):
 
 
 storage.init_db()
+
+# Startup marker + config so each run's log is self-describing. Only log from
+# the MAIN process: on macOS the process pool uses 'spawn', which re-imports
+# this module in every worker, and we don't want 12 duplicate banners.
+import multiprocessing as _mp
+if _mp.current_process().name == "MainProcess":
+    from solver.parallel import pool_size as _pool_size
+    mclog("=" * 60)
+    mclog(f"server start | cpu pool (lazy, max workers)={_pool_size()} | "
+          f"default: samples={MC_SAMPLES} budget={MC_SOLVE_BUDGET} "
+          f"time={MC_TIME_BUDGET_S}s | deep: samples={MC_DEEP_SAMPLES} "
+          f"budget={MC_DEEP_SOLVE_BUDGET} time={MC_DEEP_TIME_BUDGET_S}s")
 
 
 @dataclass
@@ -189,6 +211,9 @@ def new_game():
     state = build_opaque_state(layout)
     game = Game(state=state, layout=layout)
     GAMES[game_id] = game
+    hidden = sum(1 for col in state.tableau for _, up in col if not up)
+    mclog(f"--- NEW GAME {game_id[:8]} | hidden={hidden} | "
+          f"stock={len(state.stock)} ---")
     plan = _compute_plan(game, n=3)
 
     # solved=2 here means "accepted & planning" (distinct from the old exact
@@ -232,6 +257,7 @@ def _plan_response(game_id, state, plan):
         resp["winMargin"] = plan.get("winMargin", 0.0)
         resp["exact"] = plan.get("exact", False)
         resp["timedOut"] = plan.get("timedOut", False)
+        resp["samples"] = plan.get("samples", 0)
         resp["perMove"] = plan.get("perMove", [])
     return resp
 
@@ -246,11 +272,14 @@ def _compute_plan(game: "Game", n: int = 3) -> dict:
     """
     guaranteed = exact_win_plan(game.state, n=n)
     if guaranteed is not None:
+        mclog(f"_compute_plan -> exactGuaranteed (proven win), MC skipped")
         return guaranteed
     if game.mc_mode:
+        mclog(f"_compute_plan -> Monte Carlo (mc_mode on)")
         return mc_plan_steps(game.state, n=n, samples=MC_SAMPLES,
                              solve_budget=MC_SOLVE_BUDGET,
                              time_budget_s=MC_TIME_BUDGET_S)
+    mclog(f"_compute_plan -> greedy")
     return plan_steps(game.state, n=n)
 
 
@@ -460,8 +489,9 @@ def win_probability(game_id: str):
     budget = int(data.get("budget", MC_SOLVE_BUDGET))
     time_budget = float(data.get("timeBudget", MC_TIME_BUDGET_S))
 
+    mclog(f"/api/winprob game={game_id[:8]} samples={samples} budget={budget}")
     est = mc_position_estimate(game.state, samples=samples, solve_budget=budget,
-                               time_budget_s=time_budget)
+                               time_budget_s=time_budget, rng=_seed_rng(data))
     return jsonify({
         "gameId": game_id,
         "winProbability": est["winProbability"],
@@ -475,23 +505,56 @@ def win_probability(game_id: str):
     })
 
 
+def _seed_rng(data: dict):
+    """Build a seeded RNG when the request supplies a `seed`, else None (the MC
+    functions default to a fresh unseeded Random). An optional seed gives
+    reproducible answers for the same position (debugging / killing the
+    'different every run' confusion)."""
+    import random as _random
+
+    seed = data.get("seed")
+    if seed is None:
+        return None
+    try:
+        return _random.Random(int(seed))
+    except (TypeError, ValueError):
+        return _random.Random(str(seed))
+
+
 @app.route("/api/analyze/<game_id>", methods=["POST"])
 def analyze(game_id: str):
     """On-demand Monte Carlo analysis of the current position. Returns an
     estimated win probability and a per-move win-rate breakdown. Does not
-    change the game or require mc_mode."""
+    change the game or require mc_mode.
+
+    Body (all optional):
+      - deep: true  -> use the Deep tier (far more samples + higher per-world
+              solve budget + longer time cap).
+      - samples / budget / timeBudget: explicit overrides (win over the tier).
+      - seed: int    -> reproducible sampling.
+    """
     game = GAMES.get(game_id)
     if game is None:
         return jsonify({"error": "unknown game"}), 404
     data = request.get_json(silent=True) or {}
-    samples = int(data.get("samples", MC_SAMPLES))
-    budget = int(data.get("budget", MC_SOLVE_BUDGET))
-    time_budget = float(data.get("timeBudget", MC_TIME_BUDGET_S))
+    deep = bool(data.get("deep", False))
 
+    if deep:
+        samples = int(data.get("samples", MC_DEEP_SAMPLES))
+        budget = int(data.get("budget", MC_DEEP_SOLVE_BUDGET))
+        time_budget = float(data.get("timeBudget", MC_DEEP_TIME_BUDGET_S))
+    else:
+        samples = int(data.get("samples", MC_SAMPLES))
+        budget = int(data.get("budget", MC_SOLVE_BUDGET))
+        time_budget = float(data.get("timeBudget", MC_TIME_BUDGET_S))
+
+    mclog(f"/api/analyze game={game_id[:8]} deep={deep} samples={samples} "
+          f"budget={budget} timeBudget={time_budget}")
     est = mc_estimate(game.state, samples=samples, solve_budget=budget,
-                      time_budget_s=time_budget)
+                      time_budget_s=time_budget, rng=_seed_rng(data))
     return jsonify({
         "gameId": game_id,
+        "deep": deep,
         "winProbability": est["winProbability"],
         "winMargin": est.get("winMargin", 0.0),
         "exact": est.get("exact", False),
@@ -613,6 +676,15 @@ def _same_move(a: Move, b: Move) -> bool:
 
 def _move_is_legal(state: GameState, move: Move) -> bool:
     return any(_same_move(move, m) for m in legal_moves(state))
+
+
+# Tear down the shared Monte Carlo process pool on interpreter exit so workers
+# don't outlive the server. The pool itself is created lazily on first MC use
+# (never at import), which keeps the Flask debug reloader's supervisor process
+# from spinning one up.
+import atexit
+
+atexit.register(shutdown_pool)
 
 
 if __name__ == "__main__":
