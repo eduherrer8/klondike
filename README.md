@@ -154,8 +154,11 @@ shortest solution. Tunable via body parameters on `/api/new`:
 ## API
 
 - `POST /api/new` — parse + solve a mid-game position. Body:
-  `{columns, foundations, stock, waste, drawCount, budget, arrangements}`.
-  Returns the solution's first 3 steps, or `gameOver: true`.
+  `{columns, foundations, stock, waste, drawCount, engine}`. `engine` is one of
+  `"greedy"` (instant greedy planner, default), `"fast_mc"` (Monte Carlo at the
+  fast tier with a confidence short-circuit), or `"deep_mc"` (adaptive Monte
+  Carlo: a fast pass that escalates to the deep tier only when the move is still
+  ambiguous). Returns the solution's first 3 steps, or `gameOver: true`.
 - `GET  /api/steps/<id>?n=3` — recompute the solution, return first `n` steps.
 - `POST /api/accept/<id>` — apply an accepted move `{move}`; reports any
   `revealed` face-down cards.
@@ -168,8 +171,9 @@ shortest solution. Tunable via body parameters on `/api/new`:
 - `POST /api/analyze/<id>` — full per-move Monte Carlo comparison
   `{samples, budget, timeBudget}`; returns `winProbability` and a per-move
   win-rate breakdown. Skips the per-move loop when there's only one legal move.
-- `POST /api/mcmode/<id>` — toggle whether Monte Carlo drives recommendations
-  `{on: true|false}`.
+- `POST /api/engine/<id>` — change the recommendation engine for a live game
+  `{engine: "greedy" | "fast_mc" | "deep_mc"}`; recomputes and returns the
+  current recommendation under the new engine.
 
 ### Saved positions (debugging)
 

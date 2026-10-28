@@ -228,3 +228,17 @@ body.busy .board { opacity: 0.6; transition: opacity 0.15s; pointer-events: none
 @keyframes spin { to { transform: rotate(360deg); } }
 .status.win { color: var(--green-dark); font-weight: 700; }
 .status.gameover { color: var(--red); font-weight: 700; }
+
+/* Engine selector on the setup screen. */
+.engine-select { display: flex; flex-direction: column; gap: 6px; margin: 6px 0 2px; }
+.engine-option {
+  display: flex; align-items: center; gap: 8px; font-size: 13px; color: #333;
+  cursor: pointer; padding: 6px 8px; border: 1px solid #e3e6ec; border-radius: 6px;
+}
+.engine-option:hover { border-color: #c7cdd8; background: #fafbfc; }
+.engine-option input { margin: 0; }
+
+/* In-game engine picker (reuses the .mc-toggle row styling). */
+.mc-toggle select {
+  padding: 4px 6px; border: 1px solid #ccc; border-radius: 6px; font-size: 13px;
+}

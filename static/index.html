@@ -45,6 +45,29 @@
         <input type="text" id="wasteInput" placeholder="e.g. 10H KH 9D" />
       </label>
 
+      <h3 class="section-title">Recommendation engine</h3>
+      <p class="hint">
+        How the assistant picks each move. <strong>Normal strategy</strong> is a
+        fast greedy planner (instant). <strong>Fast MC</strong> runs Monte Carlo
+        and stops early once a move is clearly best (caps at the fast tier).
+        <strong>Deep MC</strong> is adaptive: fast when the move is clear, but
+        thinks harder (up to ~20s) on genuinely close calls.
+      </p>
+      <div class="engine-select" id="engineSelect">
+        <label class="engine-option">
+          <input type="radio" name="engine" value="greedy" checked />
+          <span><strong>Normal strategy</strong> &mdash; greedy, instant</span>
+        </label>
+        <label class="engine-option">
+          <input type="radio" name="engine" value="fast_mc" />
+          <span><strong>Fast MC</strong> &mdash; Monte Carlo, fast tier</span>
+        </label>
+        <label class="engine-option">
+          <input type="radio" name="engine" value="deep_mc" />
+          <span><strong>Deep MC</strong> &mdash; adaptive, escalates when close</span>
+        </label>
+      </div>
+
       <div class="setup-actions">
         <button id="startBtn" class="primary">Solve</button>
         <button id="fillSampleBtn">Fill example position</button>
@@ -70,8 +93,12 @@
           <button id="analyzeBtn">Analyze (Monte Carlo)</button>
           <button id="deepAnalyzeBtn">Deep analyze</button>
           <label class="mc-toggle">
-            <input type="checkbox" id="mcModeToggle" />
-            MC drives recommendations
+            Engine:
+            <select id="enginePicker">
+              <option value="greedy">Normal strategy</option>
+              <option value="fast_mc">Fast MC</option>
+              <option value="deep_mc">Deep MC</option>
+            </select>
           </label>
           <button id="resetBtn" class="ghost">New game</button>
         </div>

@@ -73,15 +73,36 @@ if _mp.current_process().name == "MainProcess":
           f"budget={MC_DEEP_SOLVE_BUDGET} time={MC_DEEP_TIME_BUDGET_S}s")
 
 
+# Recommendation engines selectable at setup. "greedy" is the instant greedy
+# planner; "fast_mc" is Monte Carlo capped at the FAST tier (with confidence
+# short-circuit); "deep_mc" is adaptive Monte Carlo (fast pass, escalate to the
+# DEEP tier only when still ambiguous). The old boolean mc_mode is gone.
+ENGINES = ("greedy", "fast_mc", "deep_mc")
+DEFAULT_ENGINE = "greedy"
+
+
+def _normalize_engine(value) -> str:
+    """Coerce an engine value to one of ENGINES, defaulting to greedy. Accepts
+    the legacy boolean mc_mode ({on:true}) by mapping True -> fast_mc."""
+    if value is True:
+        return "fast_mc"
+    if value is False or value is None:
+        return DEFAULT_ENGINE
+    v = str(value).strip().lower()
+    return v if v in ENGINES else DEFAULT_ENGINE
+
+
 @dataclass
 class Game:
     """A live game: the current opaque state (face-down cards are UNKNOWN, not
-    guessed) plus the originating layout. `mc_mode` makes Monte Carlo drive the
-    step recommendations instead of the fast greedy planner. `history` holds
-    snapshots of prior states so a mistaken move/reveal can be undone."""
+    guessed) plus the originating layout. `engine` picks which recommender
+    drives the step plan: "greedy" (instant), "fast_mc" (Monte Carlo at the
+    FAST tier with short-circuit), or "deep_mc" (adaptive: fast pass, escalate
+    to the DEEP tier only when still ambiguous). `history` holds snapshots of
+    prior states so a mistaken move/reveal can be undone."""
     state: GameState
     layout: MidGameLayout
-    mc_mode: bool = False
+    engine: str = DEFAULT_ENGINE
     history: list = field(default_factory=list)
 
     def snapshot(self) -> None:
@@ -178,6 +199,7 @@ def new_game():
     stock = data.get("stock", [])
     waste = data.get("waste") or []
     draw_count = int(data.get("drawCount", 3))
+    engine = _normalize_engine(data.get("engine"))
 
     # One id for both the in-memory game and its saved record.
     game_id = uuid.uuid4().hex
@@ -209,10 +231,10 @@ def new_game():
     # Build the opaque state (face-down cards stay unknown, never guessed) and
     # store the game first so _compute_plan can apply the proven-win shortcut.
     state = build_opaque_state(layout)
-    game = Game(state=state, layout=layout)
+    game = Game(state=state, layout=layout, engine=engine)
     GAMES[game_id] = game
     hidden = sum(1 for col in state.tableau for _, up in col if not up)
-    mclog(f"--- NEW GAME {game_id[:8]} | hidden={hidden} | "
+    mclog(f"--- NEW GAME {game_id[:8]} | engine={engine} | hidden={hidden} | "
           f"stock={len(state.stock)} ---")
     plan = _compute_plan(game, n=3)
 
@@ -259,27 +281,55 @@ def _plan_response(game_id, state, plan):
         resp["timedOut"] = plan.get("timedOut", False)
         resp["samples"] = plan.get("samples", 0)
         resp["perMove"] = plan.get("perMove", [])
+        resp["settled"] = plan.get("settled", False)
+        resp["escalated"] = plan.get("escalated", False)
+    # Always surface the engine driving this game so the UI can reflect it.
+    if g is not None:
+        resp["engine"] = g.engine
     return resp
 
 
 def _compute_plan(game: "Game", n: int = 3) -> dict:
-    """Pick the recommender.
+    """Pick the recommender based on the game's chosen engine.
 
-    If the position is a PROVEN win (exact), follow the exact solver's
-    guaranteed line — faster and certain, so Monte Carlo is skipped even when
-    the toggle is on. Otherwise use Monte Carlo (if mc_mode) or the fast greedy
-    planner.
+    Precedence: a PROVEN win (exact) always follows the exact solver's
+    guaranteed line — faster and certain — regardless of engine. Otherwise:
+      * "greedy"  -> the instant greedy planner.
+      * "fast_mc" -> Monte Carlo at the FAST tier, with the confidence
+                     short-circuit (stops early once settled).
+      * "deep_mc" -> adaptive Monte Carlo: a FAST pass first, extended to the
+                     DEEP tier only if the verdict is still ambiguous.
     """
     guaranteed = exact_win_plan(game.state, n=n)
     if guaranteed is not None:
-        mclog(f"_compute_plan -> exactGuaranteed (proven win), MC skipped")
+        mclog(f"_compute_plan engine={game.engine} -> exactGuaranteed "
+              f"(proven win), MC skipped")
         return guaranteed
-    if game.mc_mode:
-        mclog(f"_compute_plan -> Monte Carlo (mc_mode on)")
-        return mc_plan_steps(game.state, n=n, samples=MC_SAMPLES,
+
+    if game.engine == "fast_mc":
+        plan = mc_plan_steps(game.state, n=n, samples=MC_SAMPLES,
                              solve_budget=MC_SOLVE_BUDGET,
-                             time_budget_s=MC_TIME_BUDGET_S)
-    mclog(f"_compute_plan -> greedy")
+                             time_budget_s=MC_TIME_BUDGET_S, settle=True)
+        mclog(f"_compute_plan engine=fast_mc -> MC fast tier | "
+              f"settled={plan.get('settled')} "
+              f"evaluated={plan.get('samples')}/{MC_SAMPLES}")
+        return plan
+
+    if game.engine == "deep_mc":
+        # Adaptive: evaluate the FAST target first, extend to the DEEP target
+        # (same worlds) only if unsettled.
+        plan = mc_plan_steps(game.state, n=n, samples=MC_DEEP_SAMPLES,
+                             solve_budget=MC_DEEP_SOLVE_BUDGET,
+                             time_budget_s=MC_DEEP_TIME_BUDGET_S, settle=True,
+                             fast_samples=MC_SAMPLES,
+                             fast_time_budget_s=MC_TIME_BUDGET_S)
+        target = MC_DEEP_SAMPLES if plan.get("escalated") else MC_SAMPLES
+        mclog(f"_compute_plan engine=deep_mc -> MC adaptive | "
+              f"settled={plan.get('settled')} escalated={plan.get('escalated')} "
+              f"evaluated={plan.get('samples')}/{target}")
+        return plan
+
+    mclog(f"_compute_plan engine=greedy -> greedy")
     return plan_steps(game.state, n=n)
 
 
@@ -569,19 +619,20 @@ def analyze(game_id: str):
     })
 
 
-@app.route("/api/mcmode/<game_id>", methods=["POST"])
-def set_mc_mode(game_id: str):
-    """Toggle whether Monte Carlo drives the step recommendations for this game
-    (vs. the fast greedy planner). Body: {"on": true|false}."""
+@app.route("/api/engine/<game_id>", methods=["POST"])
+def set_engine(game_id: str):
+    """Change the recommendation engine for this game mid-play. Body:
+    {"engine": "greedy" | "fast_mc" | "deep_mc"}. Recomputes the current
+    recommendation under the new engine so the UI updates immediately."""
     game = GAMES.get(game_id)
     if game is None:
         return jsonify({"error": "unknown game"}), 404
     data = request.get_json(force=True)
-    game.mc_mode = bool(data.get("on", False))
-    # Recompute the current recommendation under the new mode so the UI updates.
+    game.engine = _normalize_engine(data.get("engine"))
+    mclog(f"--- SET ENGINE {game_id[:8]} | engine={game.engine} ---")
     plan = _compute_plan(game, n=3)
     resp = _plan_response(game_id, game.state, plan)
-    resp["mcMode"] = game.mc_mode
+    resp["engine"] = game.engine
     return jsonify(resp)
 
 

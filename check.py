@@ -842,6 +842,183 @@ def check_solve_deterministic():
     print("solve deterministic: OK")
 
 
+def _all_winnable_sampled_state():
+    """A deterministic 8-hidden (sampled-mode) position that is winnable in
+    EVERY arrangement: all four foundations sit at 10, each of four columns has
+    [?, ?, Jx] on top, and the global hidden pool is exactly the eight Q/K
+    cards. Whatever the arrangement, the position solves — so the win
+    probability is 1.0 and the confidence short-circuit fires at the evidence
+    floor. Used by the short-circuit / settled checks (fast: worlds solve
+    almost instantly)."""
+    from solver.resolver import build_opaque_state, parse_midgame
+
+    order = ["A", "2", "3", "4", "5", "6", "7", "8", "9", "10", "J", "Q", "K"]
+
+    def exp(s, t):
+        return [f"{r}{s}" for r in order[:order.index(t) + 1]]
+
+    fo = {s: exp(s, "10") for s in ("S", "H", "D", "C")}
+    cols = [["?", "?", "JS"], ["?", "?", "JH"], ["?", "?", "JD"],
+            ["?", "?", "JC"], [], [], []]
+    return build_opaque_state(parse_midgame(cols, [], foundations=fo, waste=[],
+                                            draw_count=3))
+
+
+def _ambiguous_heavy_state(seed: int = 15):
+    """A deterministic heavy (~21 hidden) position whose win hinges on the
+    hidden arrangement (~50% win prob) with no quickly-separating leader. With
+    a small fast target it does NOT settle in the fast pass, so adaptive Deep
+    MC must EXTEND into the deep budget (escalate). Built from a shuffled deck
+    like the other heavy fixtures."""
+    from solver.cards import UNKNOWN, full_deck
+    import random as _r
+
+    rng = _r.Random(seed)
+    deck = full_deck()
+    rng.shuffle(deck)
+    gs = GameState(draw_count=3)
+    idx = 0
+    for n in range(1, 8):
+        gs.tableau[n - 1] = [(deck[idx + i], i == n - 1) for i in range(n)]
+        idx += n
+    gs.stock = deck[idx:][::-1]
+    for col in gs.tableau:
+        for pi, (c, up) in enumerate(col):
+            if not up:
+                col[pi] = (UNKNOWN, False)
+    return gs
+
+
+def check_mc_settled_logic():
+    """The `settled` helper separates a clearly-ahead leader (True) from a
+    near-tie (False), fires on a decided (near-0/1) win probability, and
+    refuses to fire before the evidence floor."""
+    from solver.montecarlo import settled, _SETTLE_MIN_EVALUATED
+
+    # Clearly separated leader: 20 vs 2 over 22 worlds -> lower(best) above
+    # upper(2nd). win_any kept mid-range so the near-1 rule isn't what fires.
+    assert settled([20, 2], 22, {0, 1}, win_any=15) is True
+    # Near-tie: 11 vs 10 over 21 worlds -> overlapping intervals, not decided.
+    assert settled([11, 10], 21, {0, 1}, win_any=15) is False
+    # Decided win probability near 1 (every world won by some move).
+    assert settled([21, 20], 22, {0, 1}, win_any=22) is True
+    # Decided near 0 (no world won by any move).
+    assert settled([0, 0], 20, {0, 1}, win_any=0) is True
+    # Below the evidence floor: never settle, even on a lopsided count.
+    assert settled([5, 0], 5, {0, 1}, win_any=5) is False
+    assert _SETTLE_MIN_EVALUATED >= 8
+    # A single surviving contender (racing collapsed) is settled.
+    assert settled([30, 0], 30, {0}, win_any=30) is True
+    print("mc settled() logic: OK")
+
+
+def check_mc_short_circuit_stops_early():
+    """With `settle=True`, MC stops BEFORE the full target on a clear position
+    and still returns the correct best move. The all-winnable fixture has win
+    probability 1.0, so it settles at the evidence floor."""
+    import random as _r
+
+    from solver.montecarlo import estimate, _SETTLE_MIN_EVALUATED
+
+    st = _all_winnable_sampled_state()
+    target = 300
+    res = estimate(st, samples=target, solve_budget=20_000, time_budget_s=20,
+                   settle=True, rng=_r.Random(7))
+    assert res["mode"] == "sampled", res["mode"]      # genuinely sampling
+    assert res["settled"] is True, res
+    assert res["samples"] < target, res["samples"]    # stopped early
+    assert res["samples"] <= _SETTLE_MIN_EVALUATED + 4, res["samples"]
+    assert res["winProbability"] == 1.0, res["winProbability"]
+    assert res["best"] is not None and res["best"]["card"] == "JS", res["best"]
+    for pm in res["perMove"]:
+        assert pm["wins"] <= pm["trials"], pm  # invariant after short-circuit
+    print(f"mc short-circuit stops early: OK ({res['samples']} samples, "
+          f"best JS)")
+
+
+def check_mc_adaptive_deep():
+    """Adaptive Deep MC: on a CLEAR position it settles in the fast pass and
+    does NOT escalate; on an AMBIGUOUS position it DOES escalate past the fast
+    target into the deep budget. Both deterministic (seeded)."""
+    import random as _r
+
+    from solver.montecarlo import estimate
+
+    # CLEAR: all-winnable -> settles at the floor, no escalation.
+    clear = _all_winnable_sampled_state()
+    rc = estimate(clear, samples=300, solve_budget=20_000, time_budget_s=20,
+                  settle=True, fast_samples=120, fast_time_budget_s=20,
+                  rng=_r.Random(7))
+    assert rc["settled"] is True and rc["escalated"] is False, rc
+    assert rc["samples"] < 120, rc["samples"]  # never reached the fast target
+    for pm in rc["perMove"]:
+        assert pm["wins"] <= pm["trials"], pm
+
+    # AMBIGUOUS: fast target of 24 is not enough to settle -> extend to deep
+    # (48). The run must cross the fast target (escalated) and stay unsettled.
+    amb = _ambiguous_heavy_state(seed=15)
+    ra = estimate(amb, samples=48, solve_budget=3_000, time_budget_s=15,
+                  settle=True, fast_samples=24, fast_time_budget_s=15,
+                  rng=_r.Random(5))
+    assert ra["escalated"] is True, ra
+    assert ra["settled"] is False, ra
+    assert ra["samples"] > 24, ra["samples"]  # sampled beyond the fast target
+    for pm in ra["perMove"]:
+        assert pm["wins"] <= pm["trials"], pm  # invariant after escalation
+    print(f"mc adaptive deep: OK (clear settled @{rc['samples']} no-escalate; "
+          f"ambiguous escalated @{ra['samples']})")
+
+
+def check_mc_engine_modes_precedence():
+    """Proven-win and dead-stock-cycle verdicts survive the confidence
+    short-circuit and the adaptive deep path (the two highest-precedence
+    outcomes must still fire through every engine mode)."""
+    from solver.resolver import build_opaque_state, parse_midgame
+    from solver.montecarlo import exact_win_plan, mc_plan_steps
+    from solver.strategy import is_dead_stock_cycle
+
+    order = ["A", "2", "3", "4", "5", "6", "7", "8", "9", "10", "J", "Q", "K"]
+
+    def exp(s, t):
+        return [f"{r}{s}" for r in order[:order.index(t) + 1]]
+
+    # Proven win: exact_win_plan fires regardless of engine (it's checked first
+    # in _compute_plan), so it must still return a guaranteed plan here.
+    fo = {"S": exp("S", "J"), "H": exp("H", "K"), "D": exp("D", "K"),
+          "C": exp("C", "K")}
+    won = build_opaque_state(parse_midgame([["?", "QS"], [], [], [], [], [], []],
+                                           [], foundations=fo, waste=[]))
+    p = exact_win_plan(won, n=3)
+    assert p is not None and p["exactGuaranteed"], p
+
+    # Dead stock cycle: must report gameOver+stuck through BOTH the fast
+    # short-circuit path and the adaptive deep path.
+    fo2 = {"D": exp("D", "2"), "S": exp("S", "A"), "H": exp("H", "4")}
+    cols = [
+        ["KD", "QS", "JH", "10C", "9D", "8C", "7D", "6S", "5H", "4C"],
+        ["KC", "QD"], ["KS"],
+        ["?", "8D", "7C", "6D", "5C", "4D", "3C"],
+        ["?", "?", "?", "QC", "JD"], ["?", "?", "3S"],
+        ["?", "?", "?", "?", "7H"],
+    ]
+    stock = "6C KH 9S 6H JC 5D 10H 10D 9C 8H 8S 2C".split()
+    dead = build_opaque_state(parse_midgame(cols, stock, foundations=fo2,
+                                            waste=[]))
+    assert is_dead_stock_cycle(dead)
+    # fast_mc routing: settle=True
+    fast = mc_plan_steps(dead, n=3, samples=120, solve_budget=60_000,
+                         time_budget_s=5, settle=True)
+    assert fast["gameOver"] and fast.get("stuck"), fast
+    assert fast["steps"] == [] and "samples" in fast, fast
+    # deep_mc routing: settle=True + adaptive two-phase
+    deep = mc_plan_steps(dead, n=3, samples=800, solve_budget=200_000,
+                         time_budget_s=20, settle=True, fast_samples=120,
+                         fast_time_budget_s=5)
+    assert deep["gameOver"] and deep.get("stuck"), deep
+    assert deep["steps"] == [] and "samples" in deep, deep
+    print("mc engine modes precedence (proven win + dead stock): OK")
+
+
 def check_game_over_only_when_no_moves():
     """Game over must require zero legal moves, not merely 'no proven win'."""
     from solver.engine import legal_moves
@@ -882,6 +1059,10 @@ if __name__ == "__main__":
     check_parallel_matches_sequential()
     check_parallel_wins_le_trials()
     check_racing_keeps_dominant_move()
+    check_mc_settled_logic()
+    check_mc_short_circuit_stops_early()
+    check_mc_adaptive_deep()
+    check_mc_engine_modes_precedence()
     check_game_over_only_when_no_moves()
     check_solver_verdicts_stable()
     check_is_winnable_matches_solve()

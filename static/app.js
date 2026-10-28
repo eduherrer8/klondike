@@ -63,7 +63,9 @@ function collectLayout() {
   }
   const stock = parseTokens(document.getElementById("stockInput").value);
   const waste = parseTokens(document.getElementById("wasteInput").value);
-  return { columns, foundations, stock, waste, drawCount: 3 };
+  const engineEl = document.querySelector('input[name="engine"]:checked');
+  const engine = engineEl ? engineEl.value : "greedy";
+  return { columns, foundations, stock, waste, drawCount: 3, engine };
 }
 
 async function startGame() {
@@ -91,14 +93,12 @@ async function startGame() {
   status.textContent = "";
   gameId = data.gameId;
 
-  if (data.gameOver) {
-    // No legal moves at all.
-    enterSolvePhase(data.state);
-    applyStepsResponse(data);
-    return;
+  // Sync the in-game engine picker with the engine chosen at setup.
+  if (data.engine) {
+    const picker = document.getElementById("enginePicker");
+    if (picker) picker.value = data.engine;
   }
 
-  gameId = data.gameId;
   enterSolvePhase(data.state);
   applyStepsResponse(data);
 }
@@ -278,10 +278,25 @@ function applyStepsResponse(data) {
     status.className = "status gameover";
     return;
   }
+  // Keep the in-game engine picker in sync with the server's view.
+  if (data.engine) {
+    const picker = document.getElementById("enginePicker");
+    if (picker && picker.value !== data.engine) picker.value = data.engine;
+  }
+
   // Otherwise we have recommended steps.
   currentSteps = data.steps || [];
   const hidden = data.state ? data.state.faceDownCount : 0;
-  const src = data.mc ? "Monte Carlo" : "greedy";
+  let src;
+  if (data.mc) {
+    // Note how MC reached its verdict: a quick short-circuit, or escalation to
+    // the deep tier on a close call.
+    src = "Monte Carlo";
+    if (data.escalated) src += " \u00b7 deep (escalated)";
+    else if (data.settled) src += " \u00b7 settled early";
+  } else {
+    src = "greedy";
+  }
   info.textContent = (hidden
     ? `${hidden} face-down card${hidden === 1 ? "" : "s"} remaining`
     : "") + ` \u00b7 ${src}`;
@@ -504,7 +519,6 @@ function resetGame() {
   document.getElementById("setup").classList.remove("hidden");
   document.getElementById("solveStatus").textContent = "";
   document.getElementById("mcInfo").textContent = "";
-  document.getElementById("mcModeToggle").checked = false;
   updateUndoButton(false);
 }
 
@@ -577,11 +591,15 @@ function renderMcResult(data) {
   const perMove = data.perMove;
   const timedOut = data.timedOut;
 
-  const deepTag = data.deep ? "deep, " : "";
+  // Tag how the verdict was reached: manual deep, adaptive escalation, or an
+  // early short-circuit once the answer was confident.
+  let tag = data.deep ? "deep, " : "";
+  if (data.escalated) tag = "deep/escalated, ";
+  else if (data.settled) tag = "settled early, ";
   const head = exact
     ? `Win probability: ${fmtProb(winProbability, 0, true)} (exact \u2014 all layouts checked)`
     : `Estimated win probability: ${fmtProb(winProbability, margin, false)} ` +
-      `(${deepTag}${samples} sampled layouts${timedOut ? ", time-limited" : ""})`;
+      `(${tag}${samples} sampled layouts${timedOut ? ", time-limited" : ""})`;
   const lines = [head];
   if (perMove && perMove.length) {
     const top = perMove.slice(0, 4)
@@ -593,22 +611,33 @@ function renderMcResult(data) {
   mcInfo.className = "mc-info" + (pct === 0 ? " zero" : "");
 }
 
-async function toggleMcMode(on) {
+const ENGINE_LABEL = {
+  greedy: "Normal strategy",
+  fast_mc: "Fast MC",
+  deep_mc: "Deep MC",
+};
+
+async function changeEngine(engine) {
   if (!gameId) return;
   const mcInfo = document.getElementById("mcInfo");
-  mcInfo.textContent = on
-    ? "Monte Carlo now drives recommendations (slower, stronger)\u2026"
-    : "";
+  mcInfo.textContent = `Switching to ${ENGINE_LABEL[engine] || engine}\u2026`;
   mcInfo.className = "mc-info working";
-  const res = await fetch(`/api/mcmode/${gameId}`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ on }),
-  });
-  const data = await res.json();
-  if (!res.ok) {
-    mcInfo.textContent = data.error || "Could not change mode.";
-    return;
+  setBusy(true, "Recomputing under the new engine\u2026");
+  let data;
+  try {
+    const res = await fetch(`/api/engine/${gameId}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ engine }),
+    });
+    data = await res.json();
+    if (!res.ok) {
+      mcInfo.textContent = data.error || "Could not change engine.";
+      mcInfo.className = "mc-info";
+      return;
+    }
+  } finally {
+    setBusy(false);
   }
   applyStepsResponse(data);
   if (data.mc) {
@@ -630,6 +659,6 @@ document.addEventListener("DOMContentLoaded", () => {
   document.getElementById("resetBtn").onclick = resetGame;
   document.getElementById("analyzeBtn").onclick = () => analyzeMonteCarlo(false);
   document.getElementById("deepAnalyzeBtn").onclick = () => analyzeMonteCarlo(true);
-  document.getElementById("mcModeToggle").onchange = (e) => toggleMcMode(e.target.checked);
+  document.getElementById("enginePicker").onchange = (e) => changeEngine(e.target.value);
   document.getElementById("undoBtn").onclick = undoMove;
 });

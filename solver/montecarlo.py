@@ -103,6 +103,67 @@ def _wilson_interval(wins: int, trials: int, z: float = 1.96) -> tuple[float, fl
     return (p, (hi - lo) / 2, half)
 
 
+# Minimum evaluated worlds before the confidence short-circuit may fire. Reuses
+# the same evidence floor the racing-elimination logic already requires (~8), so
+# separation can't be "declared" off a handful of noisy worlds.
+_SETTLE_MIN_EVALUATED = 8
+
+
+def _wilson_bounds(wins: int, evaluated: int) -> tuple[float, float]:
+    """(lo, hi) 95% Wilson bounds for wins/evaluated, matching the clamped
+    centre/half used elsewhere so separation tests agree with racing."""
+    if evaluated <= 0:
+        return (0.0, 1.0)
+    _, _, half = _wilson_interval(wins, evaluated)
+    z2 = 1.96 * 1.96
+    denom = 1 + z2 / evaluated
+    pc = min(1.0, max(0.0, wins / evaluated))
+    centre = (pc + z2 / (2 * evaluated)) / denom
+    lo = max(0.0, centre - half)
+    hi = min(1.0, centre + half)
+    return (lo, hi)
+
+
+def settled(wins, evaluated, contenders, win_any, margin: float = 0.02) -> bool:
+    """Is the per-move verdict confident enough to stop sampling early?
+
+    `wins` is the per-move win-count list, `evaluated` the number of completed
+    worlds, `contenders` the set of still-live move indices, and `win_any` the
+    count of worlds winnable by SOME move (the position's win probability
+    numerator). Returns True when ANY of:
+
+      * racing has narrowed the field to a single contender (the leader is
+        already proven ahead of everyone else), OR
+      * the leader's Wilson LOWER bound is above the runner-up's Wilson UPPER
+        bound (statistically separated leader), OR
+      * the position's win probability is decided (within `margin` of 0 or 1).
+
+    Requires at least `_SETTLE_MIN_EVALUATED` completed worlds so separation is
+    not declared off noise. Reuses `_wilson_interval` for every bound, keeping
+    the fair-comparison / `wins <= evaluated` guarantees intact (this function
+    only reads counts, never mutates them).
+    """
+    if evaluated < _SETTLE_MIN_EVALUATED:
+        return False
+
+    # Win probability decided near 0 or 1 (fraction of worlds any move wins).
+    p_win = win_any / evaluated
+    if p_win <= margin or p_win >= 1.0 - margin:
+        return True
+
+    live = sorted(contenders)
+    if len(live) <= 1:
+        # Racing already eliminated everyone but the leader.
+        return True
+
+    # Statistically separated leader: best lower bound above 2nd-best upper.
+    bounds = {mi: _wilson_bounds(wins[mi], evaluated) for mi in live}
+    leader = max(live, key=lambda mi: wins[mi])
+    leader_lo = bounds[leader][0]
+    runner_up_hi = max(bounds[mi][1] for mi in live if mi != leader)
+    return leader_lo > runner_up_hi
+
+
 def _choose_effort(num_hidden: int, requested_samples: int) -> dict:
     """Adaptive effort selection based on how many cards are still hidden.
 
@@ -211,7 +272,9 @@ def _drain_batch(futures, deadline, _time):
 def position_estimate(state: GameState, samples: int = 60,
                       solve_budget: int = 60_000,
                       rng: random.Random | None = None,
-                      time_budget_s: float = 8.0) -> dict:
+                      time_budget_s: float = 8.0, settle: bool = False,
+                      fast_samples: int | None = None,
+                      fast_time_budget_s: float | None = None) -> dict:
     """CHEAP win-probability for the CURRENT position.
 
     Unlike `estimate`, this does NOT evaluate every legal move. It samples the
@@ -222,25 +285,35 @@ def position_estimate(state: GameState, samples: int = 60,
     Sampling across worlds is run on a shared process pool when the position is
     heavy enough to benefit; it falls back cleanly to a single-process loop for
     light positions or if the pool is unavailable.
+
+    Supports the same `settle` short-circuit and adaptive two-phase
+    (`fast_samples`/`fast_time_budget_s`) controls as `estimate`: for a
+    position estimate "settled" means the win probability is decided near 0/1.
+    Always reports `settled`/`escalated` flags.
     """
     import time as _time
 
     rng = rng or random.Random()
     deadline = (_time.monotonic() + time_budget_s) if time_budget_s else None
+    adaptive = fast_samples is not None
+    if adaptive:
+        settle = True
 
     if state.is_won():
         return {"winProbability": 1.0, "winMargin": 0.0, "exact": True,
                 "mode": "won", "samples": 0, "won": True, "gameOver": False,
-                "timedOut": False}
+                "timedOut": False, "settled": False, "escalated": False}
     if not legal_moves(state):
         return {"winProbability": 0.0, "winMargin": 0.0, "exact": True,
                 "mode": "gameover", "samples": 0, "won": False,
-                "gameOver": True, "timedOut": False}
+                "gameOver": True, "timedOut": False, "settled": False,
+                "escalated": False}
     from .strategy import is_dead_stock_cycle
     if is_dead_stock_cycle(state):
         return {"winProbability": 0.0, "winMargin": 0.0, "exact": True,
                 "mode": "gameover", "samples": 0, "won": False,
-                "gameOver": True, "stuck": True, "timedOut": False}
+                "gameOver": True, "stuck": True, "timedOut": False,
+                "settled": False, "escalated": False}
 
     slots = _hidden_slots(state)
     pool = _unknown_pool(state)
@@ -251,19 +324,32 @@ def position_estimate(state: GameState, samples: int = 60,
     mode = effort["mode"] if (num_hidden and consistent) else "exact"
     planned = effort["samples"] if (num_hidden and consistent) else 1
 
+    settle_enabled = settle and (mode == "sampled")
+    if adaptive and mode == "sampled":
+        fast_effort = _choose_effort(num_hidden, fast_samples)
+        fast_target = min(fast_effort["samples"], planned)
+        fast_deadline = (_time.monotonic() + fast_time_budget_s
+                         if fast_time_budget_s else None)
+    else:
+        fast_target = planned
+        fast_deadline = deadline
+
     from .mclog import log as _log
     _pt0 = _time.monotonic()
     _par = _should_parallelize(num_hidden, mode, planned)
     _log(f"position_estimate START hidden={num_hidden} mode={mode} "
-         f"planned={planned} parallel={_par} pool={pool_size()}")
+         f"planned={planned} fast_target={fast_target} settle={settle_enabled} "
+         f"adaptive={adaptive} parallel={_par} pool={pool_size()}")
 
-    winnable, evaluated, timed_out = _position_eval(
+    winnable, evaluated, timed_out, settled_flag, escalated = _position_eval(
         state, slots, pool, consistent, mode, planned, solve_budget, rng,
-        deadline, _time)
+        deadline, _time, settle_enabled, fast_target, fast_deadline)
 
     exact = (mode in ("exhaustive", "exact")) and not timed_out
     p, margin, _ = _wilson_interval(winnable, evaluated)
     _log(f"position_estimate DONE winnable={winnable}/{evaluated} "
+         f"fast_target={fast_target} settled={settled_flag} "
+         f"escalated={escalated} "
          f"winProb={(winnable/evaluated) if evaluated else 0.0:.2f} "
          f"timedOut={timed_out} elapsed={_time.monotonic()-_pt0:.1f}s")
     return {
@@ -275,63 +361,129 @@ def position_estimate(state: GameState, samples: int = 60,
         "won": False,
         "gameOver": False,
         "timedOut": timed_out,
+        "settled": settled_flag,
+        "escalated": escalated,
     }
 
 
+def _position_settled(winnable, evaluated, margin: float = 0.02) -> bool:
+    """A position estimate is settled when the win probability is decided near
+    0 or 1 (within `margin`), after the shared evidence floor. There are no
+    competing moves here, so only the near-0/1 criterion applies."""
+    if evaluated < _SETTLE_MIN_EVALUATED:
+        return False
+    p = winnable / evaluated
+    return p <= margin or p >= 1.0 - margin
+
+
 def _position_eval(state, slots, pool_cards, consistent, mode, planned,
-                   solve_budget, rng, deadline, _time):
+                   solve_budget, rng, deadline, _time,
+                   settle_enabled=False, fast_target=None, fast_deadline=None):
     """Evaluate `planned` worlds for 'winnable at all?', parallel or sequential.
 
-    Returns (winnable, evaluated, timed_out). Only fully-completed worlds are
-    counted so `winnable <= evaluated` always holds.
+    Returns (winnable, evaluated, timed_out, settled, escalated). Only
+    fully-completed worlds are counted so `winnable <= evaluated` always holds.
     """
+    if fast_target is None:
+        fast_target = planned
+    if fast_deadline is None:
+        fast_deadline = deadline
+
     executor = get_pool() if _should_parallelize(
         len(slots) if consistent else 0, mode, planned) else None
 
     if executor is None:
         return _position_eval_seq(state, slots, pool_cards, consistent, mode,
-                                  planned, solve_budget, rng, deadline, _time)
+                                  planned, solve_budget, rng, deadline, _time,
+                                  settle_enabled, fast_target, fast_deadline)
     try:
         return _position_eval_par(executor, state, slots, pool_cards, consistent,
                                   mode, planned, solve_budget, rng, deadline,
-                                  _time)
+                                  _time, settle_enabled, fast_target,
+                                  fast_deadline)
     except Exception:
         # A worker/pool failure must never break the request: fall back to the
         # in-process path for a clean (if slower) answer.
         return _position_eval_seq(state, slots, pool_cards, consistent, mode,
-                                  planned, solve_budget, rng, deadline, _time)
+                                  planned, solve_budget, rng, deadline, _time,
+                                  settle_enabled, fast_target, fast_deadline)
 
 
 def _position_eval_seq(state, slots, pool_cards, consistent, mode, planned,
-                       solve_budget, rng, deadline, _time):
+                       solve_budget, rng, deadline, _time,
+                       settle_enabled=False, fast_target=None,
+                       fast_deadline=None):
+    if fast_target is None:
+        fast_target = planned
+    if fast_deadline is None:
+        fast_deadline = deadline
+
     winnable = 0
     evaluated = 0
     timed_out = False
+    settled_flag = False
+    escalated = False
+    has_deep_phase = fast_target < planned
+    cur_deadline = fast_deadline
+
     for world in _world_stream(state, slots, pool_cards, consistent, mode, rng):
         if evaluated >= planned:
             break
-        if deadline is not None and _time.monotonic() >= deadline:
-            timed_out = True
-            break
+        if has_deep_phase and not escalated and evaluated >= fast_target:
+            escalated = True
+            cur_deadline = deadline
+        if cur_deadline is not None and _time.monotonic() >= cur_deadline:
+            if has_deep_phase and not escalated and (
+                    deadline is None or _time.monotonic() < deadline):
+                escalated = True
+                cur_deadline = deadline
+            else:
+                timed_out = True
+                break
         if is_winnable(world, max_states=solve_budget):
             winnable += 1
         evaluated += 1
-    return winnable, evaluated, timed_out
+        if settle_enabled and _position_settled(winnable, evaluated):
+            settled_flag = True
+            break
+    return winnable, evaluated, timed_out, settled_flag, escalated
 
 
 def _position_eval_par(executor, state, slots, pool_cards, consistent, mode,
-                       planned, solve_budget, rng, deadline, _time):
+                       planned, solve_budget, rng, deadline, _time,
+                       settle_enabled=False, fast_target=None,
+                       fast_deadline=None):
+    if fast_target is None:
+        fast_target = planned
+    if fast_deadline is None:
+        fast_deadline = deadline
+
     winnable = 0
     evaluated = 0
     timed_out = False
+    settled_flag = False
+    escalated = False
+    has_deep_phase = fast_target < planned
+    cur_deadline = fast_deadline
     batch = max(pool_size() * _BATCH_MULTIPLIER, 1)
     stream = _world_stream(state, slots, pool_cards, consistent, mode, rng)
 
     while evaluated < planned:
-        if deadline is not None and _time.monotonic() >= deadline:
-            timed_out = True
-            break
-        want = min(batch, planned - evaluated)
+        if has_deep_phase and not escalated and evaluated >= fast_target:
+            escalated = True
+            cur_deadline = deadline
+        if cur_deadline is not None and _time.monotonic() >= cur_deadline:
+            if has_deep_phase and not escalated and (
+                    deadline is None or _time.monotonic() < deadline):
+                escalated = True
+                cur_deadline = deadline
+            else:
+                timed_out = True
+                break
+        phase_target = fast_target if (has_deep_phase and not escalated) else planned
+        want = min(batch, phase_target - evaluated)
+        if want <= 0:
+            want = min(batch, planned - evaluated)
         worlds = []
         for _ in range(want):
             try:
@@ -342,7 +494,7 @@ def _position_eval_par(executor, state, slots, pool_cards, consistent, mode,
             break
         futures = _submit_batch(executor, worlds, eval_world_winnable,
                                 (solve_budget,))
-        for result, cut in _drain_batch(futures, deadline, _time):
+        for result, cut in _drain_batch(futures, cur_deadline, _time):
             if cut:
                 timed_out = True
                 break
@@ -350,8 +502,17 @@ def _position_eval_par(executor, state, slots, pool_cards, consistent, mode,
                 winnable += 1
             evaluated += 1
         if timed_out:
+            if has_deep_phase and not escalated and (
+                    deadline is None or _time.monotonic() < deadline):
+                escalated = True
+                cur_deadline = deadline
+                timed_out = False
+                continue
             break
-    return winnable, evaluated, timed_out
+        if settle_enabled and _position_settled(winnable, evaluated):
+            settled_flag = True
+            break
+    return winnable, evaluated, timed_out, settled_flag, escalated
 
 
 def exact_win_plan(state: GameState, n: int = 3, solve_budget: int = 200_000):
@@ -441,7 +602,9 @@ def exact_win_plan(state: GameState, n: int = 3, solve_budget: int = 200_000):
 
 def estimate(state: GameState, samples: int = 60, solve_budget: int = 60_000,
              rng: random.Random | None = None,
-             time_budget_s: float = 8.0) -> dict:
+             time_budget_s: float = 8.0, settle: bool = False,
+             fast_samples: int | None = None,
+             fast_time_budget_s: float | None = None) -> dict:
     """Monte Carlo analysis of the current position.
 
     Returns a dict:
@@ -452,24 +615,44 @@ def estimate(state: GameState, samples: int = 60, solve_budget: int = 60_000,
       - best: the recommended move dict (highest win rate), or None
       - gameOver: True if there are no legal moves at all
       - timedOut: True if the wall-clock budget was hit (result is best-effort)
+      - settled: True if a confidence short-circuit stopped sampling early
+      - escalated: True if an adaptive run extended past the fast target into
+        the deep budget (always False unless `fast_samples` is given)
 
     `time_budget_s` caps the wall-clock time so MC never freezes the UI on
     positions with many hidden cards; it returns the best estimate gathered so
     far. Set to 0 to disable the cap.
+
+    Confidence short-circuit (`settle=True`): the sampling loop stops as soon as
+    the verdict is confident (see `settled`). This works in BOTH the parallel
+    and sequential paths.
+
+    Adaptive two-phase (`fast_samples` / `fast_time_budget_s` given): run a FAST
+    pass first (that many worlds / that wall-clock), and only if the verdict is
+    not settled EXTEND the same sampled worlds up to the full `samples` /
+    `time_budget_s` DEEP target — the fast pass's work is never thrown away. The
+    returned `escalated` flag records whether the deep extension ran.
     """
     import time as _time
 
     rng = rng or random.Random()
     deadline = (_time.monotonic() + time_budget_s) if time_budget_s else None
+    adaptive = fast_samples is not None
+    if settle is None:
+        settle = False
+    if adaptive:
+        settle = True  # adaptive short-circuits between phases by construction
 
     if state.is_won():
         return {"winProbability": 1.0, "samples": 0, "perMove": [],
-                "best": None, "won": True, "gameOver": False}
+                "best": None, "won": True, "gameOver": False,
+                "settled": False, "escalated": False}
 
     moves = legal_moves(state)
     if not moves:
         return {"winProbability": 0.0, "samples": 0, "perMove": [],
-                "best": None, "won": False, "gameOver": True}
+                "best": None, "won": False, "gameOver": True,
+                "settled": False, "escalated": False}
 
     # Dead stock cycle: the only moves left are stock draws that never expose a
     # playable card. That's a game over even though a 'draw' is technically
@@ -479,14 +662,16 @@ def estimate(state: GameState, samples: int = 60, solve_budget: int = 60_000,
         return {"winProbability": 0.0, "winMargin": 0.0, "exact": True,
                 "mode": "gameover", "samples": 0, "perMove": [],
                 "best": None, "won": False, "gameOver": True, "stuck": True,
-                "timedOut": False}
+                "timedOut": False, "settled": False, "escalated": False}
 
     # Forced-move pruning: with a single legal move there's no choice to
     # compare, so skip the expensive per-move loop and just report the cheap
     # position estimate for that one move.
     if len(moves) == 1:
         pos = position_estimate(state, samples=samples, solve_budget=solve_budget,
-                                rng=rng, time_budget_s=time_budget_s)
+                                rng=rng, time_budget_s=time_budget_s,
+                                settle=settle, fast_samples=fast_samples,
+                                fast_time_budget_s=fast_time_budget_s)
         mv = moves[0]
         per_move = [{
             "move": {"kind": mv.kind, "src": mv.src, "dst": mv.dst,
@@ -510,6 +695,8 @@ def estimate(state: GameState, samples: int = 60, solve_budget: int = 60_000,
             "forced": True,
             "won": False,
             "gameOver": False,
+            "settled": pos.get("settled", False),
+            "escalated": pos.get("escalated", False),
         }
 
     slots = _hidden_slots(state)
@@ -526,20 +713,41 @@ def estimate(state: GameState, samples: int = 60, solve_budget: int = 60_000,
         planned = 1
         mode = "exact"  # fully known position: a single deterministic world
 
+    # Two-phase target for adaptive deep: evaluate up to the fast target first,
+    # with its own (earlier) deadline; only extend to the full `planned` DEEP
+    # target if still unsettled. For non-adaptive runs the fast phase IS the
+    # whole run. Short-circuit only applies in sampled mode (exact/exhaustive
+    # must enumerate fully to stay exact).
+    settle_enabled = settle and (mode == "sampled")
+    if adaptive and mode == "sampled":
+        fast_effort = _choose_effort(num_hidden, fast_samples)
+        fast_target = min(fast_effort["samples"], planned)
+        fast_deadline = (_time.monotonic() + fast_time_budget_s
+                         if fast_time_budget_s else None)
+    else:
+        fast_target = planned
+        fast_deadline = deadline
+
     from .mclog import log as _log
     _t0 = _time.monotonic()
     parallel = _should_parallelize(num_hidden, mode, planned)
     _log(f"estimate START moves={len(moves)} hidden={num_hidden} mode={mode} "
-         f"planned={planned} parallel={parallel} pool={pool_size()} "
-         f"solve_budget={solve_budget} time_budget={time_budget_s}")
+         f"planned={planned} fast_target={fast_target} "
+         f"settle={settle_enabled} adaptive={adaptive} parallel={parallel} "
+         f"pool={pool_size()} solve_budget={solve_budget} "
+         f"time_budget={time_budget_s}")
 
     agg = _estimate_core(state, moves, slots, pool, consistent, mode, planned,
-                         solve_budget, rng, deadline, _time)
+                         solve_budget, rng, deadline, _time,
+                         settle_enabled=settle_enabled, fast_target=fast_target,
+                         fast_deadline=fast_deadline)
     wins = agg["wins"]
     evaluated = agg["evaluated"]
     world_any_win_count = agg["world_any_win_count"]
     timed_out = agg["timed_out"]
     eliminated = agg["eliminated"]
+    settled_flag = agg.get("settled", False)
+    escalated_flag = agg.get("escalated", False)
 
     # Exhaustive + no timeout = exact (no sampling error).
     exact = (mode in ("exhaustive", "exact")) and not timed_out
@@ -566,7 +774,8 @@ def estimate(state: GameState, samples: int = 60, solve_budget: int = 60_000,
     best = per_move[0]["move"] if per_move else None
 
     _best = per_move[0] if per_move else None
-    _log(f"estimate DONE evaluated={evaluated}/{planned} "
+    _log(f"estimate DONE evaluated={evaluated}/{planned} fast_target={fast_target} "
+         f"settled={settled_flag} escalated={escalated_flag} "
          f"winProb={win_probability:.2f}+/-{(0.0 if exact else wp_margin):.2f} "
          f"timedOut={timed_out} eliminated={len(eliminated)}/{len(moves)} "
          f"best={(_best['description'] + ' @%.2f' % _best['winRate']) if _best else None} "
@@ -584,27 +793,46 @@ def estimate(state: GameState, samples: int = 60, solve_budget: int = 60_000,
         "best": best,
         "won": False,
         "gameOver": False,
+        "settled": settled_flag,
+        "escalated": escalated_flag,
     }
 
 
 def _estimate_core(state, moves, slots, pool_cards, consistent, mode, planned,
-                   solve_budget, rng, deadline, _time):
+                   solve_budget, rng, deadline, _time,
+                   settle_enabled=False, fast_target=None, fast_deadline=None):
     """Evaluate `planned` worlds across all `moves`, returning aggregate win
     counts. Dispatches to the parallel path when worthwhile, else sequential.
     Guarantees ``wins[mi] <= evaluated`` for every move (fair comparison), and
     applies racing elimination to stop sampling moves that cannot catch up.
+
+    Two-phase + short-circuit controls:
+      * `settle_enabled`: check `settled(...)` after each world/batch and stop
+        early once the verdict is confident (sampled mode only).
+      * `fast_target` / `fast_deadline`: the FAST phase stops at this world
+        count or wall-clock. If still unsettled and `planned > fast_target`, the
+        same sampled worlds are EXTENDED up to `planned` under `deadline`
+        (adaptive deep). When `fast_target == planned` this is a plain one-phase
+        run (used by Fast MC and the one-off analyze path).
     """
+    if fast_target is None:
+        fast_target = planned
+    if fast_deadline is None:
+        fast_deadline = deadline
+
     executor = get_pool() if _should_parallelize(
         len(slots) if consistent else 0, mode, planned) else None
 
     if executor is None:
         return _estimate_core_seq(state, moves, slots, pool_cards, consistent,
                                   mode, planned, solve_budget, rng, deadline,
-                                  _time)
+                                  _time, settle_enabled, fast_target,
+                                  fast_deadline)
     try:
         return _estimate_core_par(executor, state, moves, slots, pool_cards,
                                   consistent, mode, planned, solve_budget, rng,
-                                  deadline, _time)
+                                  deadline, _time, settle_enabled, fast_target,
+                                  fast_deadline)
     except Exception as exc:
         # Degrade to the in-process path on any pool/worker failure so the
         # request still returns a clean answer.
@@ -613,7 +841,8 @@ def _estimate_core(state, moves, slots, pool_cards, consistent, mode, planned,
              f"{type(exc).__name__}: {exc}")
         return _estimate_core_seq(state, moves, slots, pool_cards, consistent,
                                   mode, planned, solve_budget, rng, deadline,
-                                  _time)
+                                  _time, settle_enabled, fast_target,
+                                  fast_deadline)
 
 
 def _racing_eliminated(wins, evaluated, contenders, enabled=True):
@@ -655,8 +884,15 @@ def _racing_eliminated(wins, evaluated, contenders, enabled=True):
 
 
 def _estimate_core_seq(state, moves, slots, pool_cards, consistent, mode,
-                       planned, solve_budget, rng, deadline, _time):
+                       planned, solve_budget, rng, deadline, _time,
+                       settle_enabled=False, fast_target=None,
+                       fast_deadline=None):
     import itertools as _it
+
+    if fast_target is None:
+        fast_target = planned
+    if fast_deadline is None:
+        fast_deadline = deadline
 
     if mode == "exact" or not (slots and consistent):
         worlds_iter = iter([state.clone()])
@@ -664,6 +900,7 @@ def _estimate_core_seq(state, moves, slots, pool_cards, consistent, mode,
         worlds_iter = (_build_world(state, slots, perm)
                        for perm in _it.permutations(pool_cards))
     else:
+        # Extend lazily up to the DEEP target; the fast phase just stops early.
         worlds_iter = (_determinize(state, slots, pool_cards, rng)
                        for _ in range(planned))
 
@@ -671,21 +908,39 @@ def _estimate_core_seq(state, moves, slots, pool_cards, consistent, mode,
     world_any_win_count = 0
     evaluated = 0
     timed_out = False
+    settled_flag = False
+    escalated = False
     contenders = set(range(len(moves)))
     eliminated: set[int] = set()
+    has_deep_phase = fast_target < planned
+    # Start in the fast phase; its deadline/target gate the first pass.
+    cur_deadline = fast_deadline
 
     for world in worlds_iter:
         if evaluated >= planned:
             break
-        if deadline is not None and _time.monotonic() >= deadline:
-            timed_out = True
-            break
+        # Phase boundary: fast target reached but still unsettled -> extend the
+        # SAME sampled stream up to the deep target under the deep deadline.
+        if has_deep_phase and not escalated and evaluated >= fast_target:
+            escalated = True
+            cur_deadline = deadline
+        if cur_deadline is not None and _time.monotonic() >= cur_deadline:
+            # Deadline for the current phase hit. If we're still in the fast
+            # phase and a deep phase exists (with budget left), escalate onto
+            # the deep deadline instead of stopping.
+            if has_deep_phase and not escalated and (
+                    deadline is None or _time.monotonic() < deadline):
+                escalated = True
+                cur_deadline = deadline
+            else:
+                timed_out = True
+                break
         any_win = False
         aborted = False
         world_wins = []  # indices incremented for THIS world, so we can roll back
         for mi in sorted(contenders):
             mv = moves[mi]
-            if deadline is not None and _time.monotonic() >= deadline:
+            if cur_deadline is not None and _time.monotonic() >= cur_deadline:
                 timed_out = True
                 aborted = True
                 break
@@ -712,30 +967,70 @@ def _estimate_core_seq(state, moves, slots, pool_cards, consistent, mode,
             eliminated |= drop
             contenders -= drop
         if len(contenders) <= 1 and mode == "sampled":
+            # Racing collapsed to a single contender: the leader is proven ahead
+            # of everyone else. That IS a confident verdict, so flag it settled
+            # when short-circuit is enabled (so Deep MC reports fast/settled
+            # rather than silently stopping).
+            if settle_enabled:
+                settled_flag = True
+            break
+
+        # Confidence short-circuit: stop as soon as the verdict is confident.
+        if settle_enabled and settled(wins, evaluated, contenders,
+                                      world_any_win_count):
+            settled_flag = True
             break
 
     return {"wins": wins, "evaluated": evaluated,
             "world_any_win_count": world_any_win_count,
-            "timed_out": timed_out, "eliminated": eliminated}
+            "timed_out": timed_out, "eliminated": eliminated,
+            "settled": settled_flag, "escalated": escalated}
 
 
 def _estimate_core_par(executor, state, moves, slots, pool_cards, consistent,
-                       mode, planned, solve_budget, rng, deadline, _time):
+                       mode, planned, solve_budget, rng, deadline, _time,
+                       settle_enabled=False, fast_target=None,
+                       fast_deadline=None):
+    if fast_target is None:
+        fast_target = planned
+    if fast_deadline is None:
+        fast_deadline = deadline
+
     wins = [0] * len(moves)
     world_any_win_count = 0
     evaluated = 0
     timed_out = False
+    settled_flag = False
+    escalated = False
     contenders = set(range(len(moves)))
     eliminated: set[int] = set()
+    has_deep_phase = fast_target < planned
+    cur_deadline = fast_deadline
 
     batch = max(pool_size() * _BATCH_MULTIPLIER, 1)
+    # One lazy stream extended up to the DEEP target: escalation reuses the same
+    # worlds and simply draws MORE from this stream (never re-sampled).
     stream = _world_stream(state, slots, pool_cards, consistent, mode, rng)
 
     while evaluated < planned and len(contenders) > 1:
-        if deadline is not None and _time.monotonic() >= deadline:
-            timed_out = True
-            break
-        want = min(batch, planned - evaluated)
+        # Phase boundary: fast target reached but unsettled -> extend to deep.
+        if has_deep_phase and not escalated and evaluated >= fast_target:
+            escalated = True
+            cur_deadline = deadline
+        if cur_deadline is not None and _time.monotonic() >= cur_deadline:
+            if has_deep_phase and not escalated and (
+                    deadline is None or _time.monotonic() < deadline):
+                escalated = True
+                cur_deadline = deadline
+            else:
+                timed_out = True
+                break
+        # Never overshoot the current phase target in one batch, so the settled
+        # check gets a chance to fire at the fast boundary.
+        phase_target = fast_target if (has_deep_phase and not escalated) else planned
+        want = min(batch, phase_target - evaluated)
+        if want <= 0:
+            want = min(batch, planned - evaluated)
         worlds = []
         for _ in range(want):
             try:
@@ -756,8 +1051,9 @@ def _estimate_core_par(executor, state, moves, slots, pool_cards, consistent,
         # Each future is one world evaluated ATOMICALLY across all contenders,
         # so a completed future advances every contender together (fair), and
         # dropping an unfinished one at the deadline drops that whole world —
-        # keeping wins <= evaluated.
-        for res, cut in _drain_batch(futures, deadline, _time):
+        # keeping wins <= evaluated. Drain against the CURRENT phase deadline so
+        # the fast phase honors the fast wall-clock before escalation.
+        for res, cut in _drain_batch(futures, cur_deadline, _time):
             if cut:
                 timed_out = True
                 break
@@ -770,6 +1066,14 @@ def _estimate_core_par(executor, state, moves, slots, pool_cards, consistent,
                 world_any_win_count += 1
             evaluated += 1
         if timed_out:
+            # A fast-phase cut should escalate (if a deep phase remains) rather
+            # than end the run, so an under-filled fast batch still gets deep.
+            if has_deep_phase and not escalated and (
+                    deadline is None or _time.monotonic() < deadline):
+                escalated = True
+                cur_deadline = deadline
+                timed_out = False
+                continue
             break
 
         drop = _racing_eliminated(wins, evaluated, contenders,
@@ -778,40 +1082,65 @@ def _estimate_core_par(executor, state, moves, slots, pool_cards, consistent,
             eliminated |= drop
             contenders -= drop
 
+        # Racing collapsed to a single contender: a confident verdict.
+        if len(contenders) <= 1 and mode == "sampled":
+            if settle_enabled:
+                settled_flag = True
+            break
+
+        # Confidence short-circuit between batches (both phases).
+        if settle_enabled and settled(wins, evaluated, contenders,
+                                      world_any_win_count):
+            settled_flag = True
+            break
+
     return {"wins": wins, "evaluated": evaluated,
             "world_any_win_count": world_any_win_count,
-            "timed_out": timed_out, "eliminated": eliminated}
+            "timed_out": timed_out, "eliminated": eliminated,
+            "settled": settled_flag, "escalated": escalated}
 
 
 def mc_plan_steps(state: GameState, n: int = 3, samples: int = 60,
                   solve_budget: int = 60_000, rng: random.Random | None = None,
-                  time_budget_s: float = 8.0) -> dict:
+                  time_budget_s: float = 8.0, settle: bool = False,
+                  fast_samples: int | None = None,
+                  fast_time_budget_s: float | None = None) -> dict:
     """Monte Carlo analog of strategy.plan_steps: recommend up to n steps where
     the FIRST move is the MC-best move, and the rest follow the exact solver's
     winning line within the most-favorable sampled world (for continuity).
 
-    Shape matches strategy.plan_steps plus MC fields (winProbability, perMove).
+    Shape matches strategy.plan_steps plus MC fields (winProbability, perMove,
+    samples, and the new settled/escalated flags).
+
+    `settle` enables the confidence short-circuit; passing `fast_samples`
+    (+`fast_time_budget_s`) makes this an ADAPTIVE deep run: a fast pass first,
+    extended to the deep target only if unsettled.
     """
     from .strategy import flips_hidden_card
 
     est = estimate(state, samples=samples, solve_budget=solve_budget, rng=rng,
-                   time_budget_s=time_budget_s)
+                   time_budget_s=time_budget_s, settle=settle,
+                   fast_samples=fast_samples,
+                   fast_time_budget_s=fast_time_budget_s)
 
     if est.get("won"):
         return {"solved": True, "gameOver": False, "stuck": False, "steps": [],
                 "revealNext": False, "winProbability": 1.0, "perMove": [],
-                "mc": True}
+                "samples": est.get("samples", 0), "settled": False,
+                "escalated": False, "mc": True}
     if est["gameOver"]:
         return {"solved": False, "gameOver": True,
                 "stuck": est.get("stuck", False), "steps": [],
                 "revealNext": False, "winProbability": 0.0, "perMove": [],
-                "mc": True}
+                "samples": est.get("samples", 0), "settled": False,
+                "escalated": False, "mc": True}
 
     best = est["best"]
     if best is None:
         return {"solved": False, "gameOver": True, "stuck": False, "steps": [],
                 "revealNext": False, "winProbability": 0.0,
-                "perMove": est["perMove"], "mc": True}
+                "perMove": est["perMove"], "samples": est.get("samples", 0),
+                "settled": False, "escalated": False, "mc": True}
 
     best_move = Move(**best)
     reveal_next = flips_hidden_card(state, best_move)
@@ -862,6 +1191,8 @@ def mc_plan_steps(state: GameState, n: int = 3, samples: int = 60,
         "exact": est.get("exact", False),
         "timedOut": est.get("timedOut", False),
         "samples": est.get("samples", 0),
+        "settled": est.get("settled", False),
+        "escalated": est.get("escalated", False),
         "perMove": est["perMove"],
         "mc": True,
     }
