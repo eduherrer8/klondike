@@ -53,16 +53,20 @@ def solve(start: GameState, max_states: int = 200_000) -> list[Move] | None:
         return []
 
     counter = itertools.count()
-    start_key = start.key()
+    start_key = start.zobrist()
     # heap entries: (priority, tiebreak, depth, state, state_key)
-    heap: list[tuple[int, int, int, GameState, tuple]] = []
+    heap: list[tuple[int, int, int, GameState, int]] = []
     heapq.heappush(heap, (_heuristic(start), next(counter), 0, start, start_key))
     # best_seen: shortest known depth to reach a key (transposition table).
-    best_seen: dict[tuple, int] = {start_key: 0}
+    # Keyed by the 64-bit Zobrist hash (see game.GameState.zobrist); collisions
+    # are astronomically unlikely at these state counts (see the plan's Task 2
+    # collision argument) and the search stays deterministic because the hash
+    # is a seeded, module-level pure function of position.
+    best_seen: dict[int, int] = {start_key: 0}
     # came-from map for path reconstruction on a win (parent pointers).
-    prev: dict[tuple, tuple] = {start_key: (None, None)}
+    prev: dict[int, tuple] = {start_key: (None, None)}
     # closed set: keys already popped/expanded, never re-expanded.
-    closed: set[tuple] = set()
+    closed: set[int] = set()
     explored = 0
 
     while heap and explored < max_states:
@@ -84,7 +88,7 @@ def solve(start: GameState, max_states: int = 200_000) -> list[Move] | None:
         new_len = depth + 1
         for move in legal_moves(state):
             nxt = apply_move(state, move)
-            key = nxt.key()
+            key = nxt.zobrist()
             # Prune duplicates before any heap work: skip if already expanded,
             # or reachable at least as cheaply by a path we've already queued.
             if key in closed:
@@ -115,11 +119,11 @@ def is_winnable(start: GameState, max_states: int = 200_000) -> bool:
         return True
 
     counter = itertools.count()
-    start_key = start.key()
-    heap: list[tuple[int, int, int, GameState, tuple]] = []
+    start_key = start.zobrist()
+    heap: list[tuple[int, int, int, GameState, int]] = []
     heapq.heappush(heap, (_heuristic(start), next(counter), 0, start, start_key))
-    best_seen: dict[tuple, int] = {start_key: 0}
-    closed: set[tuple] = set()
+    best_seen: dict[int, int] = {start_key: 0}
+    closed: set[int] = set()
     explored = 0
 
     while heap and explored < max_states:
@@ -137,7 +141,7 @@ def is_winnable(start: GameState, max_states: int = 200_000) -> bool:
         new_len = depth + 1
         for move in legal_moves(state):
             nxt = apply_move(state, move)
-            key = nxt.key()
+            key = nxt.zobrist()
             if key in closed:
                 continue
             seen = best_seen.get(key)
@@ -150,7 +154,7 @@ def is_winnable(start: GameState, max_states: int = 200_000) -> bool:
     return False
 
 
-def _reconstruct(prev: dict[tuple, tuple], goal_key: tuple) -> list[Move]:
+def _reconstruct(prev: dict[int, tuple], goal_key: int) -> list[Move]:
     """Walk the came-from map from the winning state back to the start and
     return the moves in forward order."""
     moves: list[Move] = []

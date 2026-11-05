@@ -3,14 +3,36 @@
 from __future__ import annotations
 
 from .cards import UNKNOWN, Card, can_stack_foundation, can_stack_tableau, is_unknown
-from .game import GameState, Move
+from .game import (
+    GameState,
+    Move,
+    _FOUND_SUIT_IDX,
+    _Z_FOUND,
+    _Z_STOCK,
+    _Z_TAB,
+    _Z_WASTE,
+    _cell_slot,
+)
 
 
-def _flip_top(col: list[tuple[Card, bool]]) -> None:
-    """Flip the new top card face-up in place (col is a fresh, owned list)."""
+def _tab_cell_hash(col_i: int, pos: int, card: "Card", up: bool) -> int:
+    """Zobrist contribution of a single tableau cell at (col_i, pos)."""
+    return _Z_TAB[col_i][pos][_cell_slot(card.kid, up)]
+
+
+def _flip_top_delta(col_i: int, col: list[tuple[Card, bool]]) -> int:
+    """Flip the new top card of `col` face-up in place and return the Zobrist
+    delta for the running hash. `col` is a fresh, owned (shortened) list; the
+    flipped position is its last index. Returns 0 when there is nothing to flip.
+    """
     if col and not col[-1][1]:
         card, _ = col[-1]
+        pos = len(col) - 1
+        before = _tab_cell_hash(col_i, pos, card, False)
         col[-1] = (card, True)
+        after = _tab_cell_hash(col_i, pos, card, True)
+        return before ^ after
+    return 0
 
 
 def apply_move(state: GameState, move: Move) -> GameState:
@@ -28,82 +50,139 @@ def apply_move(state: GameState, move: Move) -> GameState:
     """
     kind = move.kind
     tab = state.tableau  # shared unless a column changes
+    h = state.zobrist()  # parent hash; each branch XORs only what it touches
 
     if kind == "draw":
         if not state.stock:
-            # recycle waste back into stock (preserving order)
+            # recycle waste back into stock (preserving order). stock was empty
+            # (no contribution); waste cells leave, new stock cells arrive.
+            for pos, c in enumerate(state.waste):
+                h ^= _Z_WASTE[pos][c.kid]
+            new_stock = state.waste[::-1]
+            for pos, c in enumerate(new_stock):
+                h ^= _Z_STOCK[pos][c.kid]
             return GameState(
                 tableau=tab, foundations=state.foundations,
-                stock=state.waste[::-1], waste=[], draw_count=state.draw_count,
-                fan_size=0,
+                stock=new_stock, waste=[], draw_count=state.draw_count,
+                fan_size=0, zkey=h,
             )
         n = min(state.draw_count, len(state.stock))
         new_stock = state.stock[:-n]
         drawn = state.stock[-1:-n - 1:-1]  # last n, in pop order (end first)
+        # Stock loses its last n positions; waste gains n at the tail.
+        base = len(state.stock) - n
+        for i in range(n):
+            c = state.stock[base + i]
+            h ^= _Z_STOCK[base + i][c.kid]
+        wbase = len(state.waste)
+        for i, c in enumerate(drawn):
+            h ^= _Z_WASTE[wbase + i][c.kid]
         return GameState(
             tableau=tab, foundations=state.foundations,
             stock=new_stock, waste=state.waste + drawn,
-            draw_count=state.draw_count, fan_size=n,
+            draw_count=state.draw_count, fan_size=n, zkey=h,
         )
 
     if kind == "tableau":
         new_tab = list(tab)
         src_col = tab[move.src]
-        moving = src_col[-move.count:]
-        shortened = src_col[:-move.count]
-        _flip_top(shortened)
+        count = move.count
+        src_len = len(src_col)
+        moving = src_col[-count:]
+        shortened = src_col[:-count]
+        # XOR out the moved cells from the source column (at their old
+        # positions), then XOR them back in on the destination column (at their
+        # new positions). Orientation is unchanged (a movable run is face-up).
+        src_start = src_len - count
+        for i, (c, up) in enumerate(moving):
+            h ^= _tab_cell_hash(move.src, src_start + i, c, up)
+        h ^= _flip_top_delta(move.src, shortened)
         new_tab[move.src] = shortened
-        new_tab[move.dst] = tab[move.dst] + moving
+        dst_col = tab[move.dst]
+        dst_base = len(dst_col)
+        for i, (c, up) in enumerate(moving):
+            h ^= _tab_cell_hash(move.dst, dst_base + i, c, up)
+        new_tab[move.dst] = dst_col + moving
         return GameState(
             tableau=new_tab, foundations=state.foundations,
             stock=state.stock, waste=state.waste,
-            draw_count=state.draw_count, fan_size=state.fan_size,
+            draw_count=state.draw_count, fan_size=state.fan_size, zkey=h,
         )
 
     if kind == "to_foundation":
         new_tab = list(tab)
         src_col = list(tab[move.src])
-        card, _ = src_col.pop()
-        _flip_top(src_col)
+        top_pos = len(src_col) - 1
+        card, up = src_col[-1]
+        # Remove the top card cell from the source column.
+        h ^= _tab_cell_hash(move.src, top_pos, card, up)
+        src_col.pop()
+        h ^= _flip_top_delta(move.src, src_col)
         new_tab[move.src] = src_col
+        # Foundation length for this suit grows by one.
+        fi = _FOUND_SUIT_IDX[card.suit]
+        old_len = len(state.foundations[card.suit])
+        h ^= _Z_FOUND[fi][old_len]
+        h ^= _Z_FOUND[fi][old_len + 1]
         new_found = dict(state.foundations)
         new_found[card.suit] = state.foundations[card.suit] + [card]
         return GameState(
             tableau=new_tab, foundations=new_found,
             stock=state.stock, waste=state.waste,
-            draw_count=state.draw_count, fan_size=state.fan_size,
+            draw_count=state.draw_count, fan_size=state.fan_size, zkey=h,
         )
 
     if kind == "waste_to_tableau":
         card = state.waste[-1]
+        wpos = len(state.waste) - 1
+        # Waste top (face-up known card) leaves its position.
+        h ^= _Z_WASTE[wpos][card.kid]
+        dst_col = tab[move.dst]
+        dst_pos = len(dst_col)
+        h ^= _tab_cell_hash(move.dst, dst_pos, card, True)
         new_tab = list(tab)
-        new_tab[move.dst] = tab[move.dst] + [(card, True)]
+        new_tab[move.dst] = dst_col + [(card, True)]
         return GameState(
             tableau=new_tab, foundations=state.foundations,
             stock=state.stock, waste=state.waste[:-1],
-            draw_count=state.draw_count, fan_size=max(0, state.fan_size - 1),
+            draw_count=state.draw_count,
+            fan_size=max(0, state.fan_size - 1), zkey=h,
         )
 
     if kind == "waste_to_foundation":
         card = state.waste[-1]
+        wpos = len(state.waste) - 1
+        h ^= _Z_WASTE[wpos][card.kid]
+        fi = _FOUND_SUIT_IDX[card.suit]
+        old_len = len(state.foundations[card.suit])
+        h ^= _Z_FOUND[fi][old_len]
+        h ^= _Z_FOUND[fi][old_len + 1]
         new_found = dict(state.foundations)
         new_found[card.suit] = state.foundations[card.suit] + [card]
         return GameState(
             tableau=tab, foundations=new_found,
             stock=state.stock, waste=state.waste[:-1],
-            draw_count=state.draw_count, fan_size=max(0, state.fan_size - 1),
+            draw_count=state.draw_count,
+            fan_size=max(0, state.fan_size - 1), zkey=h,
         )
 
     if kind == "foundation_to_tableau":
         card = Card.parse(move.card)
+        fi = _FOUND_SUIT_IDX[card.suit]
+        old_len = len(state.foundations[card.suit])
+        h ^= _Z_FOUND[fi][old_len]
+        h ^= _Z_FOUND[fi][old_len - 1]
         new_found = dict(state.foundations)
         new_found[card.suit] = state.foundations[card.suit][:-1]
+        dst_col = tab[move.dst]
+        dst_pos = len(dst_col)
+        h ^= _tab_cell_hash(move.dst, dst_pos, card, True)
         new_tab = list(tab)
-        new_tab[move.dst] = tab[move.dst] + [(card, True)]
+        new_tab[move.dst] = dst_col + [(card, True)]
         return GameState(
             tableau=new_tab, foundations=new_found,
             stock=state.stock, waste=state.waste,
-            draw_count=state.draw_count, fan_size=state.fan_size,
+            draw_count=state.draw_count, fan_size=state.fan_size, zkey=h,
         )
 
     raise ValueError(f"unknown move kind: {move.kind}")

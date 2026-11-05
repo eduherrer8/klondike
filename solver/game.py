@@ -10,6 +10,7 @@ Game variant:
 
 from __future__ import annotations
 
+import random as _random
 from dataclasses import dataclass, field, replace
 
 from .cards import Card, can_stack_foundation, can_stack_tableau
@@ -20,6 +21,110 @@ from .cards import Card, can_stack_foundation, can_stack_tableau
 # (matching the old (None, None, up) tuple encoding).
 _UNKNOWN_UP_KID = 0
 _UNKNOWN_DOWN_KID = 100
+
+
+# ---------------------------------------------------------------------------
+# Incremental Zobrist hashing (Task 2 of docs/plan-solver-speed-2.md)
+#
+# GameState.key() rebuilds a full nested tuple of ints for EVERY generated
+# state (~25% of solve time). The solver only needs a hashable identity for
+# dedupe, so instead of rebuilding the whole key we maintain a single 64-bit
+# integer ("zkey") that is a pure function of position and is updated by
+# XOR-ing in/out only the cells a move touches (see engine.apply_move).
+#
+# The hash captures EXACTLY what key() captures, so equal positions hash equal
+# and different positions almost surely differ:
+#   * per-column card identity + orientation, at its position in the column
+#   * foundation pile LENGTHS (per suit)
+#   * full stock order
+#   * full waste order
+#
+# The constant table is a MODULE-LEVEL CONSTANT seeded with a FIXED seed, so it
+# is identical in every process (including spawned pool workers that unpickle
+# GameStates) and across runs. This is the single most important determinism
+# property: a per-process / unseeded table would silently break dedupe
+# agreement between workers. Do NOT regenerate this per state or per process.
+# ---------------------------------------------------------------------------
+
+_ZOBRIST_SEED = 0x6B6C6F6E64696B65  # "klondike" in ascii, fixed forever
+_MASK64 = (1 << 64) - 1
+
+# Generous static bounds (a real Klondike position never exceeds these):
+#   tableau: 7 columns, a column holds at most 13 face-up (K..A) + up to 6
+#     face-down beneath = 19; 24 is a safe ceiling.
+#   stock/waste: 24 cards total in the stock+waste cycle; 24 each is safe.
+#   cell "slot": encodes (card, orientation) into a small index, see
+#     _cell_slot below; max index is 2 + 55*2 + 1 = 113, so 128 is safe.
+#   kid: 0..55 (real cards are 4..55); 56 covers it.
+#   foundation length: 0..13 -> 14 entries.
+_TAB_COLS = 7
+_MAX_COL_DEPTH = 24
+_MAX_PILE = 24
+_N_SLOTS = 128
+_N_KID = 56
+_N_FOUND_LEN = 14
+
+
+def _cell_slot(kid: int | None, up: bool) -> int:
+    """Map a tableau cell (card identity, orientation) to a small slot index.
+
+    Mirrors key()'s per-cell encoding: a face-up UNKNOWN, a face-down UNKNOWN,
+    and each real card in each orientation get a distinct index. This is the
+    index into the per-(column, position) Zobrist row.
+    """
+    if kid is None:
+        return 0 if up else 1
+    return 2 + kid * 2 + (0 if up else 1)
+
+
+def _build_zobrist_tables():
+    rng = _random.Random(_ZOBRIST_SEED)
+
+    def rand():
+        return rng.getrandbits(64)
+
+    # Z_TAB[col][pos][slot]: contribution of a tableau cell by position.
+    z_tab = [[[rand() for _ in range(_N_SLOTS)]
+              for _ in range(_MAX_COL_DEPTH)]
+             for _ in range(_TAB_COLS)]
+    # Z_FOUND[suit_idx][length]: contribution of a foundation pile's length.
+    z_found = [[rand() for _ in range(_N_FOUND_LEN)] for _ in range(4)]
+    # Z_STOCK[pos][kid] / Z_WASTE[pos][kid]: order-sensitive pile contributions.
+    z_stock = [[rand() for _ in range(_N_KID)] for _ in range(_MAX_PILE)]
+    z_waste = [[rand() for _ in range(_N_KID)] for _ in range(_MAX_PILE)]
+    return z_tab, z_found, z_stock, z_waste
+
+
+_Z_TAB, _Z_FOUND, _Z_STOCK, _Z_WASTE = _build_zobrist_tables()
+
+# Suit -> foundation index, matching the (S, H, D, C) order used by key().
+_FOUND_SUIT_IDX = {"S": 0, "H": 1, "D": 2, "C": 3}
+
+
+def compute_zkey(state: "GameState") -> int:
+    """Compute the full Zobrist hash of a position from scratch.
+
+    Used once for a freshly built / determinized / cloned state; thereafter
+    engine.apply_move maintains it incrementally. This is a PURE function of
+    position capturing exactly what key() captures, so it must agree with an
+    incrementally-maintained value for the same position.
+    """
+    h = 0
+    for col_i, col in enumerate(state.tableau):
+        ztab_col = _Z_TAB[col_i]
+        for pos, (card, up) in enumerate(col):
+            kid = card.kid
+            h ^= ztab_col[pos][_cell_slot(kid, up)]
+    f = state.foundations
+    h ^= _Z_FOUND[0][len(f["S"])]
+    h ^= _Z_FOUND[1][len(f["H"])]
+    h ^= _Z_FOUND[2][len(f["D"])]
+    h ^= _Z_FOUND[3][len(f["C"])]
+    for pos, c in enumerate(state.stock):
+        h ^= _Z_STOCK[pos][c.kid]
+    for pos, c in enumerate(state.waste):
+        h ^= _Z_WASTE[pos][c.kid]
+    return h
 
 
 @dataclass(frozen=True)
@@ -74,6 +179,15 @@ class GameState:
     # draw that haven't been played off yet). 0 before any draw. Up to
     # draw_count; smaller for a ragged tail (1 or 2 leftover cards).
     fan_size: int = 0
+    # Incrementally-maintained 64-bit Zobrist hash of this position (Task 2).
+    # A plain int (picklable, carried through clone). engine.apply_move supplies
+    # it for derived states; for a freshly-built or directly-mutated state it is
+    # None until zobrist() computes it from scratch on first use. Never rely on
+    # a cached value after mutating tableau/stock/waste/foundations in place —
+    # zobrist() is only computed for states the solver actually searches (the
+    # solver recomputes the start state's hash from scratch at the top of the
+    # search), and apply_move keeps it exact for every child.
+    zkey: int | None = None
 
     # ---- construction ----
 
@@ -179,6 +293,31 @@ class GameState:
         cells = self.tableau[col]
         return bool(cells) and cells[-1][1] and is_unknown(cells[-1][0])
 
+    def reveal_top(self, col: int, card: Card) -> None:
+        """Pin the real identity of a just-flipped face-up unknown top card.
+
+        This is the ONE sanctioned way to mutate a (possibly long-lived) state
+        in place: it replaces the face-up UNKNOWN top of `col` with the real
+        `card` AND invalidates the cached Zobrist hash in a single step, so the
+        two can never drift apart. A state derived via engine.apply_move carries
+        an incrementally-maintained `zkey`; editing a cell without clearing it
+        leaves the hash stale, which corrupts the solver's dedupe and can make
+        winnable positions look like dead ends. Routing reveals through here
+        means callers can't forget that invalidation.
+
+        Raises ValueError if the column top is not a face-up unknown awaiting
+        reveal (the only legitimate target).
+        """
+        from .cards import is_unknown
+
+        cells = self.tableau[col]
+        if not cells or not cells[-1][1] or not is_unknown(cells[-1][0]):
+            raise ValueError(
+                f"column {col} top is not a face-up unknown card to reveal"
+            )
+        cells[-1] = (card, True)
+        self.zkey = None  # in-place mutation: force zobrist() to recompute
+
     def clone(self) -> "GameState":
         return GameState(
             tableau=[list(col) for col in self.tableau],
@@ -187,12 +326,30 @@ class GameState:
             waste=list(self.waste),
             draw_count=self.draw_count,
             fan_size=self.fan_size,
+            zkey=self.zkey,
         )
 
     def is_won(self) -> bool:
         return all(len(p) == 13 for p in self.foundations.values())
 
     # ---- canonical key for search dedupe ----
+
+    def zobrist(self) -> int:
+        """64-bit Zobrist hash of this position (the solver's dedupe key).
+
+        Returns the incrementally-maintained value if present (set by
+        engine.apply_move for derived states, or carried through clone), else
+        computes it from scratch and caches it. Computing from scratch is only
+        needed for a freshly-built or directly-mutated state; the solver does it
+        once for the start state, after which every child carries an exact
+        incremental value.
+
+        This is a PURE function of position identical to what key() encodes, so
+        equal positions share a hash and the dedupe/determinism contracts hold.
+        """
+        if self.zkey is None:
+            self.zkey = compute_zkey(self)
+        return self.zkey
 
     def key(self) -> tuple:
         """Canonical, hashable identity of this state for search dedupe.

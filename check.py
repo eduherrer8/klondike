@@ -1034,6 +1034,184 @@ def check_game_over_only_when_no_moves():
     print("game over only when no moves: OK")
 
 
+def check_zobrist_equal_states_hash_equal():
+    """Zobrist contract (a): equal positions hash equal and genuinely-distinct
+    positions hash distinct (spot check). The hash must also equal a
+    from-scratch recomputation for the same position."""
+    from solver.cards import UNKNOWN, Card
+    from solver.game import GameState, compute_zkey
+
+    def build():
+        g = GameState(draw_count=3)
+        g.tableau[0] = [(Card.parse("KS"), True), (Card.parse("QH"), True)]
+        g.tableau[1] = [(Card.parse("5C"), False), (Card.parse("4D"), True)]
+        g.foundations["S"] = [Card.parse("AS")]
+        g.stock = [Card.parse("2C"), Card.parse("3H")]
+        g.waste = [Card.parse("7D")]
+        return g
+
+    a, b = build(), build()
+    assert a.zobrist() == b.zobrist(), "equal positions must hash equal"
+    # And the cached running hash equals a from-scratch recomputation.
+    assert a.zobrist() == compute_zkey(a), "hash must equal from-scratch value"
+
+    # A single differing attribute must (almost surely) change the hash.
+    variants = []
+    c = build(); c.tableau[0][-1] = (Card.parse("QD"), True); variants.append(c)
+    d = build(); d.tableau[1][0] = (Card.parse("5C"), True); variants.append(d)  # flip
+    e = build(); e.stock = [Card.parse("3H"), Card.parse("2C")]; variants.append(e)  # reorder
+    f = build(); f.foundations["S"] = [Card.parse("AS"), Card.parse("2S")]; variants.append(f)
+    g = build(); g.waste = [Card.parse("8D")]; variants.append(g)
+    base = a.zobrist()
+    for v in variants:
+        assert v.zobrist() != base, "distinct positions must hash distinct"
+    # All variants mutually distinct too (spot check).
+    hashes = [base] + [v.zobrist() for v in variants]
+    assert len(set(hashes)) == len(hashes), "spot-check positions collided"
+
+    # Face-up vs face-down UNKNOWN stay distinguishable in the hash.
+    eu = GameState(draw_count=3); eu.tableau[0] = [(UNKNOWN, True)]
+    fu = GameState(draw_count=3); fu.tableau[0] = [(UNKNOWN, False)]
+    assert eu.zobrist() != fu.zobrist(), "unknown orientation must differ"
+    print("zobrist equal/distinct spot check: OK")
+
+
+def check_zobrist_pickle_and_from_scratch():
+    """Zobrist contract (b): the running hash survives a pickle round-trip AND
+    equals a freshly-recomputed-from-scratch hash for the same position, both
+    for a built state and for states derived via apply_move."""
+    import pickle
+
+    from solver.cards import UNKNOWN, Card
+    from solver.engine import apply_move, legal_moves
+    from solver.game import GameState, compute_zkey
+
+    gs = GameState(draw_count=3)
+    gs.tableau[0] = [(Card.parse("KS"), True), (UNKNOWN, False)]
+    gs.foundations["S"] = [Card.parse("AS")]
+    gs.stock = [Card.parse("2C"), Card.parse("3H")]
+    gs.waste = [Card.parse("4D")]
+
+    h = gs.zobrist()
+    gs2 = pickle.loads(pickle.dumps(gs))
+    assert gs2.zkey == h, "running hash must survive pickle"
+    assert compute_zkey(gs2) == h, "unpickled hash must match from-scratch"
+
+    # Derived states: incremental hash must equal from-scratch for every child,
+    # and survive pickling.
+    world = _bench_worlds(seed=2, count=1)[0]
+    world.zobrist()
+    checked = 0
+    for m in legal_moves(world):
+        nxt = apply_move(world, m)
+        assert nxt.zkey == compute_zkey(nxt), f"incremental != scratch ({m.kind})"
+        rt = pickle.loads(pickle.dumps(nxt))
+        assert rt.zkey == nxt.zkey, "child hash must survive pickle"
+        assert compute_zkey(rt) == nxt.zkey
+        checked += 1
+    assert checked >= 1
+    print(f"zobrist pickle + from-scratch parity: OK ({checked} children)")
+
+
+def check_zobrist_deterministic_across_process():
+    """Zobrist contract (c): the hash is deterministic across a FRESH process
+    (same position -> same hash), proving the constant table is seeded
+    identically in every process. A per-process/unseeded table would break
+    dedupe agreement between pooled workers."""
+    import subprocess
+    import sys
+
+    snippet = (
+        "from solver.cards import Card;"
+        "from solver.game import GameState;"
+        "g=GameState(draw_count=3);"
+        "g.tableau[0]=[(Card.parse('KS'),True),(Card.parse('QH'),True)];"
+        "g.tableau[1]=[(Card.parse('5C'),False),(Card.parse('4D'),True)];"
+        "g.foundations['S']=[Card.parse('AS')];"
+        "g.stock=[Card.parse('2C'),Card.parse('3H')];"
+        "g.waste=[Card.parse('7D')];"
+        "print(g.zobrist())"
+    )
+    # Same position built in THIS process.
+    from solver.cards import Card
+    from solver.game import GameState
+    g = GameState(draw_count=3)
+    g.tableau[0] = [(Card.parse("KS"), True), (Card.parse("QH"), True)]
+    g.tableau[1] = [(Card.parse("5C"), False), (Card.parse("4D"), True)]
+    g.foundations["S"] = [Card.parse("AS")]
+    g.stock = [Card.parse("2C"), Card.parse("3H")]
+    g.waste = [Card.parse("7D")]
+    here = g.zobrist()
+
+    out = subprocess.run([sys.executable, "-c", snippet], capture_output=True,
+                         text=True, check=True)
+    there = int(out.stdout.strip())
+    assert here == there, f"hash differs across processes: {here} != {there}"
+    print(f"zobrist deterministic across process: OK ({here:#018x})")
+
+
+def check_zobrist_invalidated_on_in_place_mutation():
+    """Regression: a GameState derived via apply_move carries a CACHED Zobrist
+    hash. Mutating that state IN PLACE afterwards (as /api/reveal does when it
+    pins a revealed card onto the column top) makes the cache stale. Any such
+    mutation site MUST clear `zkey` so zobrist() recomputes; otherwise the
+    solver dedupes the whole search against a wrong key and can prune real
+    winning lines (symptom: winnable positions reported as dead ends after a
+    reveal). This reproduces the exact app.py reveal path.
+    """
+    from solver.cards import UNKNOWN, Card
+    from solver.engine import apply_move
+    from solver.game import GameState, Move, compute_zkey
+
+    # Build a position with a face-down card under a movable top, then flip it
+    # via apply_move so the resulting state carries an incremental cached zkey
+    # (the UNKNOWN is now the exposed top, exactly like the UI's reveal prompt).
+    gs = GameState(draw_count=3)
+    gs.tableau[0] = [(UNKNOWN, False), (Card.parse("5H"), True)]
+    gs.tableau[1] = [(Card.parse("6S"), True)]
+    gs.stock = [Card.parse("2C"), Card.parse("3D")]
+    # Move 5H off column 0 so the face-down card flips to a face-up UNKNOWN.
+    state = apply_move(gs, Move("tableau", src=0, dst=1, count=1, card="5H"))
+    assert state.zkey is not None, "apply_move child should carry a cached zkey"
+    top_card, top_up = state.tableau[0][-1]
+    assert top_up and top_card is UNKNOWN, "expected an exposed face-up unknown"
+
+    stale = state.zobrist()  # the cached value (reflects the UNKNOWN placeholder)
+
+    # Simulate /api/reveal: pin the real card onto the top IN PLACE.
+    state.tableau[0][-1] = (Card.parse("7C"), True)
+
+    # Without invalidation, the cache would still return `stale` (the bug).
+    assert state.zkey == stale, "precondition: cache still holds the old value"
+    assert compute_zkey(state) != stale, \
+        "the mutated position must have a different true hash than the cache"
+
+    # The fix: clearing zkey forces a correct recompute. zobrist() must then
+    # equal the from-scratch hash of the actual (mutated) position.
+    state.zkey = None
+    assert state.zobrist() == compute_zkey(state), \
+        "after invalidation, zobrist() must match the true from-scratch hash"
+
+    # The sanctioned helper GameState.reveal_top does the cell edit AND the
+    # invalidation together, so app callers can't forget. Exercise it on a
+    # fresh derived state and confirm zobrist() is correct with no manual reset.
+    state2 = apply_move(gs, Move("tableau", src=0, dst=1, count=1, card="5H"))
+    assert state2.zkey is not None
+    t2, u2 = state2.tableau[0][-1]
+    assert u2 and t2 is UNKNOWN
+    state2.reveal_top(0, Card.parse("7C"))
+    assert state2.zkey is None, "reveal_top must invalidate the cached hash"
+    assert state2.zobrist() == compute_zkey(state2), \
+        "reveal_top must leave zobrist() equal to the true hash"
+    # reveal_top guards its target: it only reveals a face-up unknown top.
+    try:
+        state2.reveal_top(0, Card.parse("8D"))  # top is now a known card
+        raise AssertionError("reveal_top should reject a non-unknown top")
+    except ValueError:
+        pass
+    print("zobrist invalidated on in-place mutation: OK")
+
+
 if __name__ == "__main__":
     check_cards()
     check_deck()
@@ -1069,6 +1247,10 @@ if __name__ == "__main__":
     check_winning_lines_reach_won()
     check_cheap_key_dedupes()
     check_solve_deterministic()
+    check_zobrist_equal_states_hash_equal()
+    check_zobrist_pickle_and_from_scratch()
+    check_zobrist_deterministic_across_process()
+    check_zobrist_invalidated_on_in_place_mutation()
 
     # Tear down the shared MC process pool so the interpreter exits cleanly.
     from solver.parallel import shutdown_pool

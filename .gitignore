@@ -1,4 +1,6 @@
 .venv/
+.venv-pypy/
+.pypy-dist/
 __pycache__/
 *.pyc
 games.db

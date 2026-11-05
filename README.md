@@ -1,7 +1,3 @@
-<<<<<<< HEAD
-# klondike
-Solitare draw 3 solver
-=======
 # Solitaire Solver
 
 A Klondike solitaire solver with a web interface. You enter a **mid-game
@@ -71,6 +67,50 @@ python3 -m venv .venv
 ```
 
 Then open http://127.0.0.1:5001
+
+## Faster: run on PyPy (optional)
+
+The hot path is the per-world exact solver (tight, branchy, pure-Python search),
+which a JIT speeds up a lot. Running the app under **PyPy** instead of CPython
+is roughly **2x faster per solve** and completes noticeably more Monte Carlo
+worlds within the same time budget — with **zero code changes** (the same
+`solver/` code runs on both). This is the recommended way to run heavy Monte
+Carlo analysis.
+
+PyPy uses its **own** set of installed packages, separate from the CPython
+`.venv/`, so it needs its own virtual environment. Set it up once:
+
+```bash
+# 1. Download the official portable PyPy 3.10 build (self-contained, no system
+#    install). Pick the build matching your OS/arch from https://pypy.org/download.html
+curl -L -o /tmp/pypy.tar.bz2 \
+  https://downloads.python.org/pypy/pypy3.10-v7.3.17-linux64.tar.bz2
+tar xjf /tmp/pypy.tar.bz2 -C /tmp
+
+# 2. Keep the distribution inside the project (it is gitignored).
+cp -r /tmp/pypy3.10-v7.3.17-linux64 .pypy-dist
+
+# 3. Create a PyPy virtualenv and install the dependencies into it.
+.pypy-dist/bin/pypy -m venv .venv-pypy
+.venv-pypy/bin/pip install -r requirements.txt
+```
+
+Then run the app (or the checks) with the PyPy interpreter:
+
+```bash
+.venv-pypy/bin/pypy app.py      # dev server on :5001, now JIT-accelerated
+.venv-pypy/bin/pypy check.py    # sanity suite under PyPy
+```
+
+Notes:
+- The PyPy build must match your platform. The URL above is Linux x86-64; macOS
+  (`-macos_x86_64` / `-macos_arm64`) and other arches are on the download page.
+  It must be a **3.10** build to match the code's syntax.
+- Both `.venv/` (CPython) and `.venv-pypy/` (PyPy) are gitignored, as is the
+  `.pypy-dist/` distribution — each developer sets up their own.
+- CPython remains perfectly fine for normal use; PyPy is purely a speed option.
+- PyPy's JIT needs a brief warmup, so the very first request is a little slow;
+  the reused Monte Carlo worker processes stay "hot" after that.
 
 ## How to use
 
@@ -199,4 +239,3 @@ sqlite3 games.db "SELECT id, created_iso, solved, total_moves, error FROM games 
 ```bash
 .venv/bin/python check.py
 ```
->>>>>>> 5a29921 (Monte Carlo solver with uncertainty handling and play-quality fixes)

@@ -436,8 +436,11 @@ def reveal_card(game_id: str):
                    f"again.")
         return jsonify({"error": msg, "revealRetry": {"col": col}}), 400
 
-    # Pin the revealed identity onto the top of the column.
-    game.state.tableau[col][-1] = (real, True)
+    # Pin the revealed identity onto the top of the column. reveal_top mutates
+    # the state in place AND invalidates the cached Zobrist hash together, so
+    # the solver never dedupes against a stale key (which previously made
+    # winnable positions look like dead ends after a reveal).
+    game.state.reveal_top(col, real)
 
     plan = _compute_plan(game, n=3)
     resp = _plan_response(game_id, game.state, plan)
