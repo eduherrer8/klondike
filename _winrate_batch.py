@@ -56,12 +56,33 @@ def deal(seed):
     return gs, truth
 
 
-def autoplay(seed, samples, solve_budget, time_s, max_steps=1000):
+def autoplay(seed, samples, solve_budget, time_s, max_steps=300,
+             loop_limit=40):
+    """Play one deal to completion under uncertainty.
+
+    Loop guard: we track the Zobrist hash of every position visited. In this
+    blind-play loop a hash only changes when a card is revealed or a foundation
+    advances (UNKNOWN cards make the state distinct), so REVISITING a hash means
+    the planner made a cycle of known-card/stock moves with no real progress.
+    If we revisit positions `loop_limit` times without ever seeing a new one,
+    the game is stuck in a loop -> classify as LOOP and stop, instead of
+    grinding to `max_steps` (which was costing up to ~45 min per game).
+    """
     st, truth = deal(seed)
     init_wp = None
+    seen = set()
+    stale = 0  # consecutive steps that produced no new position
     for step in range(max_steps):
         if st.is_won():
             return {'outcome': 'WON', 'steps': step, 'init_wp': init_wp}
+        key = st.zobrist()
+        if key in seen:
+            stale += 1
+            if stale >= loop_limit:
+                return {'outcome': 'LOOP', 'steps': step, 'init_wp': init_wp}
+        else:
+            seen.add(key)
+            stale = 0
         p = mc_plan_steps(st, n=1, samples=samples, solve_budget=solve_budget,
                           time_budget_s=time_s, settle=True,
                           rng=random.Random(seed * 100 + step))
@@ -141,7 +162,7 @@ def main():
             wins += 1
             if init_wp is not None:
                 won_wps.append(init_wp)
-        elif outcome in ('STUCK', 'GAMEOVER', 'NOSTEPS', 'MAXSTEPS'):
+        elif outcome in ('STUCK', 'GAMEOVER', 'NOSTEPS', 'MAXSTEPS', 'LOOP'):
             if init_wp is not None:
                 lost_wps.append(init_wp)
         done = i + 1
@@ -169,11 +190,12 @@ def main():
         'STUCK':      'lost - STUCK (only stock-cycle left)  ',
         'GAMEOVER':   'lost - GAMEOVER (no legal moves)      ',
         'NOSTEPS':    'lost - NOSTEPS (planner found no move)',
+        'LOOP':       'lost - LOOP (planner cycled, no gain) ',
         'MAXSTEPS':   'lost - MAXSTEPS (hit step cap)        ',
         'REVEAL_MISS':'bug  - REVEAL_MISS (reveal mismatch)  ',
         'ERROR':      'bug  - ERROR (exception raised)       ',
     }
-    for key in ('WON', 'STUCK', 'GAMEOVER', 'NOSTEPS', 'MAXSTEPS',
+    for key in ('WON', 'STUCK', 'GAMEOVER', 'NOSTEPS', 'LOOP', 'MAXSTEPS',
                 'REVEAL_MISS', 'ERROR'):
         c = res.get(key, 0)
         if c:
